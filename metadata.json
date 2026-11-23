@@ -1,0 +1,6 @@
+{
+  "name": "DUEL — Online Multiplayer Snake & Ladders",
+  "description": "Two Friends. One Battle. Private real-time multiplayer Snake & Ladders with live WebRTC voice chat.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
