@@ -66,8 +66,22 @@ export function useWebRTCVoice({
         'stun:stun1.l.google.com:19302',
         'stun:stun2.l.google.com:19302',
         'stun:stun3.l.google.com:19302',
+        'stun:stun.cloudflare.com:3478',
       ],
     },
+    ...(import.meta.env.VITE_TURN_URL
+      ? [
+          {
+            urls: import.meta.env.VITE_TURN_URL,
+            ...(import.meta.env.VITE_TURN_USERNAME
+              ? { username: import.meta.env.VITE_TURN_USERNAME }
+              : {}),
+            ...(import.meta.env.VITE_TURN_CREDENTIAL
+              ? { credential: import.meta.env.VITE_TURN_CREDENTIAL }
+              : {}),
+          } satisfies RTCIceServer,
+        ]
+      : []),
   ]);
 
   const makingOfferRef = useRef(false);
@@ -84,6 +98,9 @@ export function useWebRTCVoice({
 
   // Fetch STUN/TURN ICE configuration when connected to a Node.js backend
   useEffect(() => {
+    if (import.meta.env.VITE_TURN_URL) {
+      setHasTurnServer(true);
+    }
     let active = true;
     const baseUrl = getServerUrl();
     fetch(`${baseUrl}/api/ice-config`)
@@ -443,7 +460,7 @@ export function useWebRTCVoice({
     const handlePeerReady = async () => {
       if (!roomCode || !opponentConnected) return;
       const pc = createPeerConnection();
-      // Polite/Slot-1 initiates fresh offer when peer reconnects
+      // Slot-1 initiates (or re-sends) offer when peer connects/reconnects
       if (mySlot === 1 && pc.signalingState === 'stable') {
         try {
           makingOfferRef.current = true;
@@ -456,6 +473,14 @@ export function useWebRTCVoice({
         } finally {
           makingOfferRef.current = false;
         }
+      } else if (
+        mySlot === 1 &&
+        pc.signalingState === 'have-local-offer' &&
+        pc.localDescription &&
+        pc.iceConnectionState !== 'connected' &&
+        pc.iceConnectionState !== 'completed'
+      ) {
+        socket.emit('voice:offer', { sdp: pc.localDescription.toJSON() });
       }
     };
 

@@ -1,4 +1,3 @@
-import Peer, { type DataConnection } from 'peerjs';
 import {
   AVATAR_OPTIONS,
   LADDERS,
@@ -9,6 +8,7 @@ import {
   type PlayerState,
   type PublicRoomState,
 } from '../shared/gameConstants.ts';
+import { MqttWssClient } from './mqttWssClient.ts';
 
 export type AckFn = (response: Record<string, unknown>) => void;
 export type EventListener = (...args: unknown[]) => void;
@@ -25,19 +25,14 @@ export interface RealtimeClient {
   once(event: string, listener: EventListener): void;
 }
 
-const PEER_PREFIX = 'duel-snl-v1-';
+const TOPIC_PREFIX = 'duel-snl/v1';
 const ROOM_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const ROOM_CODE_LENGTH = 6;
 
-const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
-  {
-    urls: [
-      'stun:stun.l.google.com:19302',
-      'stun:stun1.l.google.com:19302',
-      'stun:stun2.l.google.com:19302',
-      'stun:stun3.l.google.com:19302',
-    ],
-  },
+const PUBLIC_WSS_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://test.mosquitto.org:8081/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
 ];
 
 function randomInt(maxExclusive: number): number {
@@ -78,9 +73,10 @@ function sanitizeAvatarId(raw: unknown, fallbackSlot: PlayerSlot): string {
   return AVATAR_OPTIONS[fallbackSlot === 1 ? 0 : 1].id;
 }
 
-interface WireMessage {
+interface WireEnvelope {
   kind: 'rpc' | 'ack' | 'broadcast' | 'signal';
   reqId?: string;
+  fromClientId?: string;
   event?: string;
   payload?: unknown;
   response?: Record<string, unknown>;
@@ -92,20 +88,24 @@ export class P2PRealtimeClient implements RealtimeClient {
   private _active = true;
 
   private listeners = new Map<string, Set<EventListener>>();
-  private peer: Peer | null = null;
+  private mqtt: MqttWssClient | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private role: 'none' | 'host' | 'guest' = 'none';
+  private clientConnId: string = generateId();
 
-  // Host state
+  // Host state (strictly in-memory for the active session)
   private hostRoom: PublicRoomState | null = null;
   private hostPlayerId: string | null = null;
   private guestPlayerId: string | null = null;
   private guestSecret: string | null = null;
-  private guestConn: DataConnection | null = null;
+  private guestClientConnId: string | null = null;
   private firstTurnSlot: PlayerSlot = 1;
 
   // Guest state
-  private hostConn: DataConnection | null = null;
+  private activeRoomCode: string | null = null;
   private pendingAcks = new Map<string, AckFn>();
+
+  private visibilityCleanup: (() => void) | null = null;
 
   public get connected(): boolean {
     return this._connected;
@@ -122,7 +122,7 @@ export class P2PRealtimeClient implements RealtimeClient {
   }
 
   public disconnect(): void {
-    this.teardownPeer();
+    this.teardownTransport();
     this._active = false;
     this._connected = false;
     this.dispatch('disconnect');
@@ -157,41 +157,74 @@ export class P2PRealtimeClient implements RealtimeClient {
     }
   }
 
-  private teardownPeer(): void {
+  private attachBrowserResumeListeners(): void {
+    this.detachBrowserResumeListeners();
+    if (typeof document === 'undefined' || typeof window === 'undefined') {
+      return;
+    }
+    const onResume = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        this.role !== 'none' &&
+        this.mqtt &&
+        !this.mqtt.connected
+      ) {
+        void this.mqtt.reconnectNow();
+      }
+    };
+    const onOnline = () => {
+      if (this.role !== 'none' && this.mqtt && !this.mqtt.connected) {
+        void this.mqtt.reconnectNow();
+      }
+    };
+    const onPageHide = () => {
+      if (this.role === 'host' && this.hostRoom && this.mqtt?.connected) {
+        this.broadcastFromHost('room:host-left', {});
+      }
+    };
+
+    document.addEventListener('visibilitychange', onResume);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('pagehide', onPageHide);
+
+    this.visibilityCleanup = () => {
+      document.removeEventListener('visibilitychange', onResume);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }
+
+  private detachBrowserResumeListeners(): void {
+    if (this.visibilityCleanup) {
+      this.visibilityCleanup();
+      this.visibilityCleanup = null;
+    }
+  }
+
+  private teardownTransport(): void {
+    this.detachBrowserResumeListeners();
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     for (const ack of this.pendingAcks.values()) {
       ack({ ok: false, error: 'Connection closed.' });
     }
     this.pendingAcks.clear();
 
-    if (this.guestConn) {
-      try {
-        this.guestConn.close();
-      } catch {
-        // Ignore
-      }
-      this.guestConn = null;
+    if (this.mqtt) {
+      this.mqtt.close();
+      this.mqtt = null;
     }
-    if (this.hostConn) {
-      try {
-        this.hostConn.close();
-      } catch {
-        // Ignore
-      }
-      this.hostConn = null;
-    }
-    if (this.peer) {
-      try {
-        this.peer.destroy();
-      } catch {
-        // Ignore
-      }
-      this.peer = null;
-    }
+
     this.role = 'none';
+    this.activeRoomCode = null;
     this.hostRoom = null;
     this.hostPlayerId = null;
     this.guestPlayerId = null;
     this.guestSecret = null;
+    this.guestClientConnId = null;
     this.firstTurnSlot = 1;
   }
 
@@ -234,15 +267,23 @@ export class P2PRealtimeClient implements RealtimeClient {
       return;
     }
 
-    if (this.role === 'guest' && this.hostConn && this.hostConn.open) {
+    if (this.role === 'guest' && this.activeRoomCode && this.mqtt) {
+      const toHostTopic = `${TOPIC_PREFIX}/${this.activeRoomCode}/to-host`;
+
       if (event.startsWith('voice:')) {
-        this.hostConn.send({ kind: 'signal', event, payload } satisfies WireMessage);
+        this.sendToTopic(toHostTopic, {
+          kind: 'signal',
+          fromClientId: this.clientConnId,
+          event,
+          payload,
+        });
         return;
       }
+
       const reqId = generateId();
       if (ack) {
         this.pendingAcks.set(reqId, ack);
-        window.setTimeout(() => {
+        setTimeout(() => {
           const pending = this.pendingAcks.get(reqId);
           if (pending) {
             this.pendingAcks.delete(reqId);
@@ -250,11 +291,46 @@ export class P2PRealtimeClient implements RealtimeClient {
           }
         }, 7000);
       }
-      this.hostConn.send({ kind: 'rpc', reqId, event, payload } satisfies WireMessage);
+
+      const sent = this.sendToTopic(toHostTopic, {
+        kind: 'rpc',
+        reqId,
+        fromClientId: this.clientConnId,
+        event,
+        payload,
+      });
+
+      if (!sent && ack) {
+        this.pendingAcks.delete(reqId);
+        void this.mqtt.reconnectNow();
+        ack({
+          ok: false,
+          error: 'Reconnecting to room channel. Please try again.',
+        });
+      }
       return;
     }
 
     ack?.({ ok: false, error: 'Not connected to a room.' });
+  }
+
+  private sendToTopic(topic: string, msg: WireEnvelope): boolean {
+    if (!this.mqtt || !this.mqtt.connected) return false;
+    return this.mqtt.publish(topic, JSON.stringify(msg));
+  }
+
+  private scheduleAutoReconnect(client: MqttWssClient): void {
+    if (this.reconnectTimer !== null || this.mqtt !== client) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.mqtt === client && this.role !== 'none' && !client.connected) {
+        void client.reconnectNow().then(() => {
+          if (this.mqtt === client && !client.connected) {
+            this.scheduleAutoReconnect(client);
+          }
+        });
+      }
+    }, 1200);
   }
 
   private async handleCreateRoom(
@@ -267,15 +343,41 @@ export class P2PRealtimeClient implements RealtimeClient {
       return;
     }
 
-    this.teardownPeer();
+    this.teardownTransport();
 
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const roomCode = generateRoomCode();
-      const peerId = `${PEER_PREFIX}${roomCode}`;
+    const roomCode = generateRoomCode();
+    const toHostTopic = `${TOPIC_PREFIX}/${roomCode}/to-host`;
+
+    for (const brokerUrl of PUBLIC_WSS_BROKERS) {
+      const client = new MqttWssClient(
+        brokerUrl,
+        (topic, rawPayload) => {
+          if (topic === toHostTopic) {
+            this.onHostReceivedMessage(rawPayload);
+          }
+        },
+        {
+          onDisconnect: () => {
+            if (this.mqtt === client && this.role === 'host') {
+              this.scheduleAutoReconnect(client);
+            }
+          },
+          onReconnect: () => {
+            if (this.mqtt === client && this.role === 'host' && this.hostRoom) {
+              this.broadcastFromHost('room:updated', this.cloneRoom(this.hostRoom));
+            }
+          },
+        }
+      );
+
       try {
-        const peer = await this.openPeer(peerId);
-        this.peer = peer;
+        await client.connect(4500);
+        await client.subscribe(toHostTopic, 3500);
+
+        this.mqtt = client;
         this.role = 'host';
+        this.activeRoomCode = roomCode;
+        this.clientConnId = generateId();
 
         const now = Date.now();
         const playerId = generateId();
@@ -310,7 +412,7 @@ export class P2PRealtimeClient implements RealtimeClient {
           createdAt: now,
         };
 
-        this.attachHostPeerListeners(peer);
+        this.attachBrowserResumeListeners();
 
         ack?.({
           ok: true,
@@ -320,163 +422,115 @@ export class P2PRealtimeClient implements RealtimeClient {
           room: this.cloneRoom(this.hostRoom),
         });
         return;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : '';
-        if (msg.includes('unavailable-id') && attempt < 3) {
-          continue;
+      } catch {
+        client.close();
+      }
+    }
+
+    this.teardownTransport();
+    ack?.({
+      ok: false,
+      error:
+        'Could not connect to the public relay network. Check your internet connection and try again.',
+    });
+  }
+
+  private onHostReceivedMessage(rawPayload: string): void {
+    if (this.role !== 'host' || !this.hostRoom) return;
+    let msg: WireEnvelope;
+    try {
+      msg = JSON.parse(rawPayload) as WireEnvelope;
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg !== 'object') return;
+
+    const fromClientId =
+      typeof msg.fromClientId === 'string' ? msg.fromClientId : '';
+    if (!fromClientId) return;
+
+    if (msg.kind === 'rpc' && msg.event) {
+      const replyTopic = `${TOPIC_PREFIX}/${this.hostRoom.roomCode}/to-guest/${fromClientId}`;
+      const reply = (response: Record<string, unknown>) => {
+        if (msg.reqId) {
+          this.sendToTopic(replyTopic, {
+            kind: 'ack',
+            reqId: msg.reqId,
+            response,
+          });
         }
-        this.teardownPeer();
-        ack?.({
-          ok: false,
-          error:
-            'Could not register room on peer signaling network. Please try again.',
-        });
+      };
+
+      if (msg.event === 'room:join') {
+        this.handleHostIncomingJoin(
+          fromClientId,
+          msg.payload as Record<string, unknown> | undefined,
+          reply
+        );
         return;
       }
+
+      if (msg.event === 'room:reconnect') {
+        this.handleHostIncomingReconnect(
+          fromClientId,
+          msg.payload as Record<string, unknown> | undefined,
+          reply
+        );
+        return;
+      }
+
+      if (fromClientId !== this.guestClientConnId || !this.guestPlayerId) {
+        reply({ ok: false, error: 'Unauthorized or expired player session.' });
+        return;
+      }
+
+      if (msg.event === 'room:leave') {
+        this.handleHostGuestLeft();
+        reply({ ok: true });
+        return;
+      }
+
+      this.handleHostAction(
+        this.guestPlayerId,
+        msg.event,
+        msg.payload as Record<string, unknown> | undefined,
+        reply
+      );
+      return;
+    }
+
+    if (
+      msg.kind === 'signal' &&
+      msg.event &&
+      fromClientId === this.guestClientConnId &&
+      this.guestPlayerId
+    ) {
+      const p = (msg.payload as Record<string, unknown> | undefined) ?? {};
+      if (msg.event === 'voice:state') {
+        const guest = this.hostRoom.players.find(
+          (pl) => pl.playerId === this.guestPlayerId
+        );
+        if (guest) {
+          if (typeof p.micEnabled === 'boolean') guest.micEnabled = p.micEnabled;
+          if (typeof p.micMuted === 'boolean') guest.micMuted = p.micMuted;
+          this.broadcastFromHost('room:updated', this.cloneRoom(this.hostRoom));
+        }
+        return;
+      }
+      if (msg.event === 'voice:ready') {
+        this.dispatch('voice:peer-ready', { playerId: this.guestPlayerId });
+        return;
+      }
+      this.dispatch(msg.event, {
+        ...p,
+        fromPlayerId: this.guestPlayerId,
+        playerId: this.guestPlayerId,
+      });
     }
   }
 
-  private openPeer(explicitId?: string): Promise<Peer> {
-    return new Promise((resolve, reject) => {
-      const options = {
-        config: { iceServers: DEFAULT_ICE_SERVERS },
-        debug: 0,
-      };
-      const peer = explicitId ? new Peer(explicitId, options) : new Peer(options);
-      let settled = false;
-
-      const timer = window.setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          try {
-            peer.destroy();
-          } catch {
-            // Ignore
-          }
-          reject(new Error('Peer signaling timed out.'));
-        }
-      }, 10000);
-
-      peer.once('open', () => {
-        if (!settled) {
-          settled = true;
-          window.clearTimeout(timer);
-          resolve(peer);
-        }
-      });
-
-      peer.once('error', (err) => {
-        if (!settled) {
-          settled = true;
-          window.clearTimeout(timer);
-          try {
-            peer.destroy();
-          } catch {
-            // Ignore
-          }
-          reject(new Error(err?.type || err?.message || 'Peer error'));
-        }
-      });
-    });
-  }
-
-  private attachHostPeerListeners(peer: Peer): void {
-    peer.on('connection', (conn) => {
-      conn.on('data', (raw) => {
-        const msg = raw as WireMessage;
-        if (!msg || typeof msg !== 'object') return;
-
-        if (msg.kind === 'rpc' && msg.event) {
-          const reply = (response: Record<string, unknown>) => {
-            if (msg.reqId && conn.open) {
-              conn.send({
-                kind: 'ack',
-                reqId: msg.reqId,
-                response,
-              } satisfies WireMessage);
-            }
-          };
-
-          if (msg.event === 'room:join') {
-            this.handleHostIncomingJoin(
-              conn,
-              msg.payload as Record<string, unknown> | undefined,
-              reply
-            );
-            return;
-          }
-
-          if (msg.event === 'room:reconnect') {
-            this.handleHostIncomingReconnect(
-              conn,
-              msg.payload as Record<string, unknown> | undefined,
-              reply
-            );
-            return;
-          }
-
-          if (conn !== this.guestConn || !this.guestPlayerId) {
-            reply({ ok: false, error: 'Unauthorized connection.' });
-            return;
-          }
-
-          if (msg.event === 'room:leave') {
-            this.handleHostGuestLeft();
-            reply({ ok: true });
-            return;
-          }
-
-          this.handleHostAction(
-            this.guestPlayerId,
-            msg.event,
-            msg.payload as Record<string, unknown> | undefined,
-            reply
-          );
-          return;
-        }
-
-        if (msg.kind === 'signal' && msg.event && conn === this.guestConn) {
-          const p = (msg.payload as Record<string, unknown> | undefined) ?? {};
-          if (msg.event === 'voice:state' && this.hostRoom && this.guestPlayerId) {
-            const guest = this.hostRoom.players.find(
-              (pl) => pl.playerId === this.guestPlayerId
-            );
-            if (guest) {
-              if (typeof p.micEnabled === 'boolean') guest.micEnabled = p.micEnabled;
-              if (typeof p.micMuted === 'boolean') guest.micMuted = p.micMuted;
-              this.broadcastFromHost('room:updated', this.cloneRoom(this.hostRoom));
-            }
-            return;
-          }
-          if (msg.event === 'voice:ready') {
-            this.dispatch('voice:peer-ready', { playerId: this.guestPlayerId });
-            return;
-          }
-          this.dispatch(msg.event, {
-            ...p,
-            fromPlayerId: this.guestPlayerId,
-            playerId: this.guestPlayerId,
-          });
-        }
-      });
-
-      conn.on('close', () => {
-        if (conn === this.guestConn && this.hostRoom && this.guestPlayerId) {
-          const guest = this.hostRoom.players.find(
-            (pl) => pl.playerId === this.guestPlayerId
-          );
-          if (guest) {
-            guest.connected = false;
-            guest.lastSeenAt = Date.now();
-            this.dispatch('room:updated', this.cloneRoom(this.hostRoom));
-          }
-        }
-      });
-    });
-  }
-
   private handleHostIncomingJoin(
-    conn: DataConnection,
+    fromClientId: string,
     payload: Record<string, unknown> | undefined,
     reply: AckFn
   ): void {
@@ -484,6 +538,25 @@ export class P2PRealtimeClient implements RealtimeClient {
       reply({ ok: false, error: 'Room not found.' });
       return;
     }
+
+    // Idempotent retry from the exact same guest connection attempt
+    if (
+      fromClientId === this.guestClientConnId &&
+      this.guestPlayerId &&
+      this.guestSecret
+    ) {
+      const snapshot = this.cloneRoom(this.hostRoom);
+      reply({
+        ok: true,
+        roomCode: this.hostRoom.roomCode,
+        playerId: this.guestPlayerId,
+        reconnectSecret: this.guestSecret,
+        room: snapshot,
+      });
+      this.broadcastFromHost('room:updated', snapshot);
+      return;
+    }
+
     const nickname = sanitizeNickname(payload?.nickname);
     if (!nickname) {
       reply({ ok: false, error: 'Please enter a nickname (1–18 characters).' });
@@ -523,7 +596,7 @@ export class P2PRealtimeClient implements RealtimeClient {
 
     this.guestPlayerId = playerId;
     this.guestSecret = reconnectSecret;
-    this.guestConn = conn;
+    this.guestClientConnId = fromClientId;
     this.hostRoom.players = [...this.hostRoom.players, guestPlayer];
 
     const snapshot = this.cloneRoom(this.hostRoom);
@@ -538,7 +611,7 @@ export class P2PRealtimeClient implements RealtimeClient {
   }
 
   private handleHostIncomingReconnect(
-    conn: DataConnection,
+    fromClientId: string,
     payload: Record<string, unknown> | undefined,
     reply: AckFn
   ): void {
@@ -560,7 +633,7 @@ export class P2PRealtimeClient implements RealtimeClient {
       return;
     }
 
-    this.guestConn = conn;
+    this.guestClientConnId = fromClientId;
     guest.connected = true;
     guest.lastSeenAt = Date.now();
     const snapshot = this.cloneRoom(this.hostRoom);
@@ -584,14 +657,8 @@ export class P2PRealtimeClient implements RealtimeClient {
     );
     this.guestPlayerId = null;
     this.guestSecret = null;
-    if (this.guestConn) {
-      try {
-        this.guestConn.close();
-      } catch {
-        // Ignore
-      }
-      this.guestConn = null;
-    }
+    this.guestClientConnId = null;
+
     this.hostRoom.phase = 'lobby';
     this.hostRoom.currentTurnPlayerId = null;
     this.hostRoom.winnerPlayerId = null;
@@ -630,8 +697,8 @@ export class P2PRealtimeClient implements RealtimeClient {
       return;
     }
 
-    if (this.guestConn && this.guestConn.open) {
-      this.guestConn.send({
+    if (this.guestClientConnId) {
+      this.sendToTopic(`${TOPIC_PREFIX}/${this.hostRoom.roomCode}/broadcast`, {
         kind: 'signal',
         event: event === 'voice:ready' ? 'voice:peer-ready' : event,
         payload: {
@@ -639,7 +706,7 @@ export class P2PRealtimeClient implements RealtimeClient {
           fromPlayerId: this.hostPlayerId,
           playerId: this.hostPlayerId,
         },
-      } satisfies WireMessage);
+      });
     }
   }
 
@@ -722,7 +789,7 @@ export class P2PRealtimeClient implements RealtimeClient {
 
       let landedPosition = fromPosition;
       let finalPosition = fromPosition;
-      let steps: number[] = [];
+      const steps: number[] = [];
       let overshot = false;
       let transition: MoveRecord['transition'] = null;
       let won = false;
@@ -843,12 +910,12 @@ export class P2PRealtimeClient implements RealtimeClient {
 
   private broadcastFromHost(event: string, payload: unknown): void {
     this.dispatch(event, payload);
-    if (this.guestConn && this.guestConn.open) {
-      this.guestConn.send({
+    if (this.hostRoom) {
+      this.sendToTopic(`${TOPIC_PREFIX}/${this.hostRoom.roomCode}/broadcast`, {
         kind: 'broadcast',
         event,
         payload,
-      } satisfies WireMessage);
+      });
     }
   }
 
@@ -867,7 +934,7 @@ export class P2PRealtimeClient implements RealtimeClient {
       return;
     }
 
-    await this.connectToHostAndRpc(
+    await this.connectGuestToHostAndRpc(
       roomCode,
       'room:join',
       { roomCode, nickname, avatarId: payload?.avatarId },
@@ -884,7 +951,7 @@ export class P2PRealtimeClient implements RealtimeClient {
       ack?.({ ok: false, error: 'Invalid room code.' });
       return;
     }
-    await this.connectToHostAndRpc(
+    await this.connectGuestToHostAndRpc(
       roomCode,
       'room:reconnect',
       {
@@ -896,127 +963,189 @@ export class P2PRealtimeClient implements RealtimeClient {
     );
   }
 
-  private async connectToHostAndRpc(
+  private async connectGuestToHostAndRpc(
     roomCode: string,
     rpcEvent: string,
     rpcPayload: Record<string, unknown>,
     ack?: AckFn
   ): Promise<void> {
-    this.teardownPeer();
+    this.teardownTransport();
 
-    try {
-      const peer = await this.openPeer();
-      this.peer = peer;
-      this.role = 'guest';
+    const guestConnId = generateId();
+    this.clientConnId = guestConnId;
 
-      const conn = peer.connect(`${PEER_PREFIX}${roomCode}`, { reliable: true });
-      this.hostConn = conn;
+    const toHostTopic = `${TOPIC_PREFIX}/${roomCode}/to-host`;
+    const toGuestTopic = `${TOPIC_PREFIX}/${roomCode}/to-guest/${guestConnId}`;
+    const broadcastTopic = `${TOPIC_PREFIX}/${roomCode}/broadcast`;
 
-      await new Promise<void>((resolve, reject) => {
-        let done = false;
-        const timer = window.setTimeout(() => {
-          if (!done) {
-            done = true;
-            reject(new Error('Room not found or host is unreachable.'));
-          }
-        }, 9000);
+    for (let brokerIdx = 0; brokerIdx < PUBLIC_WSS_BROKERS.length; brokerIdx += 1) {
+      const brokerUrl = PUBLIC_WSS_BROKERS[brokerIdx];
+      const isPrimary = brokerIdx === 0;
+      const connectTimeout = isPrimary ? 3500 : 3000;
+      const probeWaitMs = isPrimary ? 4300 : 2800;
 
-        conn.once('open', () => {
-          if (!done) {
-            done = true;
-            window.clearTimeout(timer);
-            resolve();
-          }
-        });
+      let resolvedOrRejected = false;
+      let retryTimers: ReturnType<typeof setTimeout>[] = [];
 
-        peer.once('error', (err) => {
-          if (!done) {
-            done = true;
-            window.clearTimeout(timer);
-            if (err?.type === 'peer-unavailable') {
-              reject(new Error('Room not found or host closed the room.'));
-            } else {
-              reject(new Error('Could not connect to room host.'));
+      const clearRetryTimers = () => {
+        for (const t of retryTimers) clearTimeout(t);
+        retryTimers = [];
+      };
+
+      const client = new MqttWssClient(
+        brokerUrl,
+        (topic, rawPayload) => {
+          this.onGuestReceivedMessage(
+            topic,
+            toGuestTopic,
+            broadcastTopic,
+            rawPayload
+          );
+        },
+        {
+          onDisconnect: () => {
+            if (this.mqtt === client && this.role === 'guest') {
+              this.scheduleAutoReconnect(client);
             }
+          },
+        }
+      );
+
+      try {
+        await client.connect(connectTimeout);
+        await Promise.all([
+          client.subscribe(toGuestTopic, 3000),
+          client.subscribe(broadcastTopic, 3000),
+        ]);
+
+        this.mqtt = client;
+        this.role = 'guest';
+        this.activeRoomCode = roomCode;
+
+        const reqId = generateId();
+        const response = await new Promise<Record<string, unknown> | null>(
+          (resolve) => {
+            const finish = (res: Record<string, unknown> | null) => {
+              if (resolvedOrRejected) return;
+              resolvedOrRejected = true;
+              clearRetryTimers();
+              this.pendingAcks.delete(reqId);
+              resolve(res);
+            };
+
+            this.pendingAcks.set(reqId, (res) => finish(res));
+
+            const sendAttempt = () => {
+              if (resolvedOrRejected || !client.connected) return;
+              client.publish(
+                toHostTopic,
+                JSON.stringify({
+                  kind: 'rpc',
+                  reqId,
+                  fromClientId: guestConnId,
+                  event: rpcEvent,
+                  payload: rpcPayload,
+                } satisfies WireEnvelope)
+              );
+            };
+
+            sendAttempt();
+            // Retry cleanly in case Host briefly switched apps on mobile
+            retryTimers.push(setTimeout(sendAttempt, 1400));
+            if (isPrimary) {
+              retryTimers.push(setTimeout(sendAttempt, 2800));
+            }
+            retryTimers.push(setTimeout(() => finish(null), probeWaitMs));
           }
-        });
-      });
+        );
 
-      conn.on('data', (raw) => {
-        const msg = raw as WireMessage;
-        if (!msg || typeof msg !== 'object') return;
-
-        if (msg.kind === 'ack' && msg.reqId) {
-          const pending = this.pendingAcks.get(msg.reqId);
-          if (pending) {
-            this.pendingAcks.delete(msg.reqId);
-            pending(msg.response ?? { ok: false, error: 'Empty response.' });
-          }
-          return;
-        }
-
-        if (msg.kind === 'broadcast' && msg.event) {
-          this.dispatch(msg.event, msg.payload);
-          return;
-        }
-
-        if (msg.kind === 'signal' && msg.event) {
-          this.dispatch(msg.event, msg.payload);
-        }
-      });
-
-      conn.on('close', () => {
-        if (this.role === 'guest') {
-          this.dispatch('room:peer-left', { nickname: 'Host' });
-        }
-      });
-
-      const reqId = generateId();
-      if (ack) {
-        this.pendingAcks.set(reqId, (response) => {
+        if (response !== null) {
           if (!response.ok) {
-            this.teardownPeer();
+            this.teardownTransport();
+          } else {
+            this.attachBrowserResumeListeners();
           }
-          ack(response);
-        });
-        window.setTimeout(() => {
-          const pending = this.pendingAcks.get(reqId);
-          if (pending) {
-            this.pendingAcks.delete(reqId);
-            this.teardownPeer();
-            pending({ ok: false, error: 'Timed out joining room.' });
-          }
-        }, 7000);
+          ack?.(response);
+          return;
+        }
+
+        // No host answered on this broker — clean up and try next fallback broker
+        this.pendingAcks.clear();
+        this.mqtt = null;
+        this.role = 'none';
+        this.activeRoomCode = null;
+        client.close();
+      } catch {
+        clearRetryTimers();
+        this.pendingAcks.clear();
+        if (this.mqtt === client) {
+          this.mqtt = null;
+          this.role = 'none';
+          this.activeRoomCode = null;
+        }
+        client.close();
+      }
+    }
+
+    this.teardownTransport();
+    ack?.({
+      ok: false,
+      error:
+        'Room not found or host left. Ask your friend to keep their room screen open and check the 6-character code.',
+    });
+  }
+
+  private onGuestReceivedMessage(
+    topic: string,
+    toGuestTopic: string,
+    broadcastTopic: string,
+    rawPayload: string
+  ): void {
+    let msg: WireEnvelope;
+    try {
+      msg = JSON.parse(rawPayload) as WireEnvelope;
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg !== 'object') return;
+
+    if (topic === toGuestTopic && msg.kind === 'ack' && msg.reqId) {
+      const pending = this.pendingAcks.get(msg.reqId);
+      if (pending) {
+        this.pendingAcks.delete(msg.reqId);
+        pending(msg.response ?? { ok: false, error: 'Empty response.' });
+      }
+      return;
+    }
+
+    if (topic === broadcastTopic) {
+      if (msg.kind === 'broadcast' && msg.event) {
+        if (msg.event === 'room:host-left') {
+          this.dispatch('room:peer-left', { nickname: 'Host' });
+          return;
+        }
+        this.dispatch(msg.event, msg.payload);
+        return;
       }
 
-      conn.send({
-        kind: 'rpc',
-        reqId,
-        event: rpcEvent,
-        payload: rpcPayload,
-      } satisfies WireMessage);
-    } catch (err) {
-      this.teardownPeer();
-      ack?.({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Unable to join room.',
-      });
+      if (msg.kind === 'signal' && msg.event) {
+        this.dispatch(msg.event, msg.payload);
+      }
     }
   }
 
   private handleLeaveRoom(ack?: AckFn): void {
-    if (this.role === 'guest' && this.hostConn && this.hostConn.open) {
-      try {
-        this.hostConn.send({
-          kind: 'rpc',
-          reqId: generateId(),
-          event: 'room:leave',
-        } satisfies WireMessage);
-      } catch {
-        // Ignore
-      }
+    if (this.role === 'guest' && this.activeRoomCode && this.mqtt?.connected) {
+      this.sendToTopic(`${TOPIC_PREFIX}/${this.activeRoomCode}/to-host`, {
+        kind: 'rpc',
+        reqId: generateId(),
+        fromClientId: this.clientConnId,
+        event: 'room:leave',
+      });
+    } else if (this.role === 'host' && this.hostRoom && this.mqtt?.connected) {
+      this.broadcastFromHost('room:host-left', {});
     }
-    this.teardownPeer();
+    this.teardownTransport();
     ack?.({ ok: true });
   }
 

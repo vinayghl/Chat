@@ -65,6 +65,10 @@ export default function App() {
       setConnectionError(null);
       const saved = loadEphemeralSession();
       if (saved) {
+        if (socket.mode === 'p2p' && saved.isHost) {
+          clearEphemeralSession();
+          return;
+        }
         socket.emit('room:reconnect', saved, (rawRes: unknown) => {
           const res = rawRes as AckRoomResponse;
           if (res?.ok && res.room && res.playerId) {
@@ -212,7 +216,7 @@ export default function App() {
             setError('Timed out creating room. Please try again.');
             resolve();
           }
-        }, 12000);
+        }, 16000);
 
         socket.emit(
           'room:create',
@@ -233,6 +237,7 @@ export default function App() {
                 roomCode: res.roomCode,
                 playerId: res.playerId,
                 reconnectSecret: res.reconnectSecret,
+                isHost: true,
               });
               setMyPlayerId(res.playerId);
               setRoom(res.room);
@@ -269,7 +274,7 @@ export default function App() {
             setError('Timed out joining room. Please try again.');
             resolve();
           }
-        }, 12000);
+        }, 18000);
 
         socket.emit(
           'room:join',
@@ -290,6 +295,7 @@ export default function App() {
                 roomCode: res.roomCode,
                 playerId: res.playerId,
                 reconnectSecret: res.reconnectSecret,
+                isHost: false,
               });
               setMyPlayerId(res.playerId);
               setRoom(res.room);

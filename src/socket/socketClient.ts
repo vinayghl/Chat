@@ -246,6 +246,7 @@ export interface EphemeralSession {
   roomCode: string;
   playerId: string;
   reconnectSecret: string;
+  isHost?: boolean;
 }
 
 const SESSION_KEY = 'duel_ephemeral_session';
@@ -272,6 +273,7 @@ export function loadEphemeralSession(): EphemeralSession | null {
         roomCode: parsed.roomCode,
         playerId: parsed.playerId,
         reconnectSecret: parsed.reconnectSecret,
+        isHost: Boolean(parsed.isHost),
       };
     }
     return null;
