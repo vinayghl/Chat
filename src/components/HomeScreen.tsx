@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
-import { HelpCircle, Plus, LogIn, Swords, Wifi, WifiOff } from 'lucide-react';
+import { HelpCircle, Plus, LogIn, Swords, Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import { AVATAR_OPTIONS } from '../shared/gameConstants.ts';
 import { PlayerAvatar } from './PlayerAvatar.tsx';
 import { HowToPlayModal } from './HowToPlayModal.tsx';
 
 interface HomeScreenProps {
   socketConnected: boolean;
+  connectionError: string | null;
+  onRetryConnection: () => void;
   initialRoomCode: string;
   onCreateRoom: (nickname: string, avatarId: string) => Promise<void>;
   onJoinRoom: (roomCode: string, nickname: string, avatarId: string) => Promise<void>;
@@ -15,6 +17,8 @@ interface HomeScreenProps {
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
   socketConnected,
+  connectionError,
+  onRetryConnection,
   initialRoomCode,
   onCreateRoom,
   onJoinRoom,
@@ -82,17 +86,22 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </span>
         </div>
 
-        <div className="hidden sm:flex items-center gap-2 text-xs text-slate-400">
+        <div className="flex items-center gap-2 text-xs text-slate-400">
           {socketConnected ? (
             <>
               <Wifi className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Server Ready</span>
+              <span className="hidden sm:inline">Server Ready</span>
             </>
           ) : (
-            <>
-              <WifiOff className="w-3.5 h-3.5 text-amber-400" />
-              <span>Connecting to server...</span>
-            </>
+            <button
+              type="button"
+              onClick={onRetryConnection}
+              className="inline-flex items-center gap-1.5 text-amber-300 hover:text-amber-200 cursor-pointer"
+            >
+              <WifiOff className="w-3.5 h-3.5" />
+              <span>Connecting...</span>
+              <RefreshCw className="w-3 h-3" />
+            </button>
           )}
         </div>
 
@@ -188,12 +197,21 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 </div>
               </div>
 
-              {displayedError && (
+              {(displayedError || (!socketConnected && connectionError)) && (
                 <div
                   role="alert"
-                  className="rounded-xl bg-rose-500/10 border border-rose-500/30 px-4 py-3 text-sm text-rose-200"
+                  className="rounded-xl bg-rose-500/10 border border-rose-500/30 px-4 py-3 text-sm text-rose-200 flex items-center justify-between gap-3"
                 >
-                  {displayedError}
+                  <span>{displayedError || connectionError}</span>
+                  {!socketConnected && (
+                    <button
+                      type="button"
+                      onClick={onRetryConnection}
+                      className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-xs font-semibold text-rose-100 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Retry
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -214,7 +232,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   </div>
                   <button
                     type="submit"
-                    disabled={!socketConnected || submitting !== null}
+                    disabled={submitting !== null}
                     className="w-full min-h-[48px] px-4 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-bold text-sm inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap cursor-pointer"
                   >
                     <Plus className="w-4 h-4" />
@@ -258,7 +276,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   </div>
                   <button
                     type="submit"
-                    disabled={!socketConnected || submitting !== null}
+                    disabled={submitting !== null}
                     className="w-full min-h-[48px] px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-bold text-sm inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap cursor-pointer"
                   >
                     <LogIn className="w-4 h-4" />

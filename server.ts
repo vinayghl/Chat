@@ -1,10 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Server as SocketIOServer } from 'socket.io';
-import { createServer as createViteServer } from 'vite';
 import { cleanupExpiredRooms, getActiveRoomCount } from './server/rooms.ts';
 import { registerSocketHandlers } from './server/socketHandlers.ts';
 
@@ -18,6 +18,9 @@ async function bootstrap() {
 
   const httpServer = http.createServer(app);
   const io = new SocketIOServer(httpServer, {
+    path: '/socket.io/',
+    transports: ['polling', 'websocket'],
+    allowEIO3: true,
     cors: {
       origin: true,
       credentials: true,
@@ -70,17 +73,28 @@ async function bootstrap() {
     res.json({ iceServers, hasTurn });
   });
 
-  if (process.env.NODE_ENV !== 'production') {
+  const distPath = path.resolve(__dirname, 'dist');
+  const hasDist = fs.existsSync(path.join(distPath, 'index.html'));
+  const isDevMode =
+    process.env.NODE_ENV === 'development' ||
+    (!hasDist && process.env.NODE_ENV !== 'production');
+
+  if (isDevMode) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR !== 'true',
+        hmr: process.env.DISABLE_HMR !== 'true' ? { server: httpServer } : false,
       },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.resolve(__dirname, 'dist');
+    if (!fs.existsSync(path.join(distPath, 'index.html'))) {
+      console.warn(
+        'Warning: dist/index.html not found. Run "npm run build" before starting in production.'
+      );
+    }
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
@@ -89,7 +103,9 @@ async function bootstrap() {
 
   const port = Number(process.env.PORT) || 3000;
   httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`DUEL multiplayer server listening on http://0.0.0.0:${port}`);
+    console.log(
+      `DUEL multiplayer server (${isDevMode ? 'dev' : 'production'}) listening on http://0.0.0.0:${port}`
+    );
   });
 }
 

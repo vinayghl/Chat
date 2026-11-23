@@ -26,6 +26,7 @@ export default function App() {
   const socket = useMemo(() => getSocket(), []);
 
   const [socketConnected, setSocketConnected] = useState(socket.connected);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [room, setRoom] = useState<PublicRoomState | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,6 +59,7 @@ export default function App() {
   useEffect(() => {
     const handleConnect = () => {
       setSocketConnected(true);
+      setConnectionError(null);
       const saved = loadEphemeralSession();
       if (saved) {
         socket.emit('room:reconnect', saved, (res: AckRoomResponse) => {
@@ -74,6 +76,25 @@ export default function App() {
 
     const handleDisconnect = () => {
       setSocketConnected(false);
+    };
+
+    const handleConnectError = async (err: Error) => {
+      setSocketConnected(false);
+      try {
+        const res = await fetch('/api/health');
+        const contentType = res.headers.get('content-type') ?? '';
+        if (res.ok && contentType.includes('application/json')) {
+          setConnectionError(
+            `Reconnecting real-time channel (${err.message || 'transport retry'})...`
+          );
+          return;
+        }
+      } catch {
+        // Backend unreachable
+      }
+      setConnectionError(
+        'Cannot reach the multiplayer backend server. Ensure the app is started with "npm start" (node server.ts).'
+      );
     };
 
     const handleRoomUpdated = (updatedRoom: PublicRoomState) => {
@@ -106,18 +127,23 @@ export default function App() {
 
     socket.on('connect', handleConnect);
     socket.on('disconnect', handleDisconnect);
+    socket.on('connect_error', handleConnectError);
     socket.on('room:updated', handleRoomUpdated);
     socket.on('game:move', handleGameMove);
     socket.on('room:peer-left', handlePeerLeft);
     socket.on('chat:message', handleChatMessage);
 
+    setSocketConnected(socket.connected);
     if (socket.connected) {
       handleConnect();
+    } else if (!socket.active) {
+      socket.connect();
     }
 
     return () => {
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
+      socket.off('connect_error', handleConnectError);
       socket.off('room:updated', handleRoomUpdated);
       socket.off('game:move', handleGameMove);
       socket.off('room:peer-left', handlePeerLeft);
@@ -125,16 +151,70 @@ export default function App() {
     };
   }, [socket]);
 
+  const ensureConnected = useCallback(
+    () =>
+      new Promise<boolean>((resolve) => {
+        if (socket.connected) {
+          resolve(true);
+          return;
+        }
+        socket.connect();
+        const timer = window.setTimeout(() => {
+          socket.off('connect', onConnect);
+          resolve(false);
+        }, 5500);
+        const onConnect = () => {
+          window.clearTimeout(timer);
+          resolve(true);
+        };
+        socket.once('connect', onConnect);
+      }),
+    [socket]
+  );
+
+  const handleRetryConnection = useCallback(() => {
+    setConnectionError(null);
+    socket.disconnect();
+    socket.connect();
+  }, [socket]);
+
   const handleCreateRoom = useCallback(
-    (nickname: string, avatarId: string) =>
-      new Promise<void>((resolve) => {
-        soundFx.unlock();
-        setError(null);
+    async (nickname: string, avatarId: string) => {
+      soundFx.unlock();
+      setError(null);
+      const ready = await ensureConnected();
+      if (!ready) {
+        setError(
+          connectionError ??
+            'Unable to connect to the multiplayer server. Please try again.'
+        );
+        return;
+      }
+
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const timeoutId = window.setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            setError('Server timed out creating room. Please try again.');
+            resolve();
+          }
+        }, 7000);
+
         socket.emit(
           'room:create',
           { nickname, avatarId },
           (res: AckRoomResponse) => {
-            if (res?.ok && res.room && res.playerId && res.roomCode && res.reconnectSecret) {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeoutId);
+            if (
+              res?.ok &&
+              res.room &&
+              res.playerId &&
+              res.roomCode &&
+              res.reconnectSecret
+            ) {
               saveEphemeralSession({
                 roomCode: res.roomCode,
                 playerId: res.playerId,
@@ -149,20 +229,48 @@ export default function App() {
             resolve();
           }
         );
-      }),
-    [socket]
+      });
+    },
+    [connectionError, ensureConnected, socket]
   );
 
   const handleJoinRoom = useCallback(
-    (roomCode: string, nickname: string, avatarId: string) =>
-      new Promise<void>((resolve) => {
-        soundFx.unlock();
-        setError(null);
+    async (roomCode: string, nickname: string, avatarId: string) => {
+      soundFx.unlock();
+      setError(null);
+      const ready = await ensureConnected();
+      if (!ready) {
+        setError(
+          connectionError ??
+            'Unable to connect to the multiplayer server. Please try again.'
+        );
+        return;
+      }
+
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const timeoutId = window.setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            setError('Server timed out joining room. Please try again.');
+            resolve();
+          }
+        }, 7000);
+
         socket.emit(
           'room:join',
           { roomCode, nickname, avatarId },
           (res: AckRoomResponse) => {
-            if (res?.ok && res.room && res.playerId && res.roomCode && res.reconnectSecret) {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeoutId);
+            if (
+              res?.ok &&
+              res.room &&
+              res.playerId &&
+              res.roomCode &&
+              res.reconnectSecret
+            ) {
               saveEphemeralSession({
                 roomCode: res.roomCode,
                 playerId: res.playerId,
@@ -177,8 +285,9 @@ export default function App() {
             resolve();
           }
         );
-      }),
-    [socket]
+      });
+    },
+    [connectionError, ensureConnected, socket]
   );
 
   const handleToggleReady = useCallback(
@@ -276,6 +385,8 @@ export default function App() {
       {!room || !myPlayerId ? (
         <HomeScreen
           socketConnected={socketConnected}
+          connectionError={connectionError}
+          onRetryConnection={handleRetryConnection}
           initialRoomCode={initialRoomCode}
           onCreateRoom={handleCreateRoom}
           onJoinRoom={handleJoinRoom}
