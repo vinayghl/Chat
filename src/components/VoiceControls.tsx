@@ -18,6 +18,7 @@ export const VoiceControls: React.FC<VoiceControlsProps> = ({
     micMuted,
     permissionError,
     voiceStatus,
+    voiceWarning,
     isSelfSpeaking,
     isOpponentSpeaking,
     audioPlaybackBlocked,
@@ -25,6 +26,7 @@ export const VoiceControls: React.FC<VoiceControlsProps> = ({
     disableMicrophone,
     toggleMute,
     resumeRemoteAudio,
+    retryVoiceConnection,
   } = voice;
 
   const statusMeta = (() => {
@@ -115,6 +117,19 @@ export const VoiceControls: React.FC<VoiceControlsProps> = ({
           <Volume2 className="w-4 h-4" />
           <span>Tap to Unblock Opponent Audio</span>
         </button>
+      )}
+
+      {voiceWarning && (
+        <div className="rounded-xl bg-amber-500/10 border border-amber-500/30 px-3 py-2.5 text-xs text-amber-200 flex items-center justify-between gap-2.5">
+          <span>{voiceWarning}</span>
+          <button
+            type="button"
+            onClick={retryVoiceConnection}
+            className="px-2.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Retry Audio
+          </button>
+        </div>
       )}
 
       {permissionError && (

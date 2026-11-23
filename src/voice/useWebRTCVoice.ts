@@ -26,6 +26,7 @@ export interface UseWebRTCVoiceReturn {
   permissionState: MicPermissionState;
   permissionError: string | null;
   voiceStatus: VoiceConnectionStatus;
+  voiceWarning: string | null;
   isSelfSpeaking: boolean;
   isOpponentSpeaking: boolean;
   hasTurnServer: boolean;
@@ -34,6 +35,7 @@ export interface UseWebRTCVoiceReturn {
   disableMicrophone: () => void;
   toggleMute: () => void;
   resumeRemoteAudio: () => void;
+  retryVoiceConnection: () => void;
   teardownVoice: () => void;
 }
 
@@ -49,9 +51,10 @@ export function useWebRTCVoice({
   const [permissionState, setPermissionState] = useState<MicPermissionState>('prompt');
   const [permissionError, setPermissionError] = useState<string | null>(null);
   const [voiceStatus, setVoiceStatus] = useState<VoiceConnectionStatus>('idle');
+  const [voiceWarning, setVoiceWarning] = useState<string | null>(null);
   const [isSelfSpeaking, setIsSelfSpeaking] = useState(false);
   const [isOpponentSpeaking, setIsOpponentSpeaking] = useState(false);
-  const [hasTurnServer, setHasTurnServer] = useState(false);
+  const [hasTurnServer, setHasTurnServer] = useState(Boolean(import.meta.env.VITE_TURN_URL));
   const [audioPlaybackBlocked, setAudioPlaybackBlocked] = useState(false);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -59,13 +62,13 @@ export function useWebRTCVoice({
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const remoteAudioElRef = useRef<HTMLAudioElement | null>(null);
   const audioSenderRef = useRef<RTCRtpSender | null>(null);
+
   const iceConfigRef = useRef<RTCIceServer[]>([
     {
       urls: [
         'stun:stun.l.google.com:19302',
         'stun:stun1.l.google.com:19302',
         'stun:stun2.l.google.com:19302',
-        'stun:stun3.l.google.com:19302',
         'stun:stun.cloudflare.com:3478',
       ],
     },
@@ -84,23 +87,28 @@ export function useWebRTCVoice({
       : []),
   ]);
 
+  const stateRef = useRef({ roomCode, myPlayerId, mySlot, opponentConnected });
+  stateRef.current = { roomCode, myPlayerId, mySlot, opponentConnected };
+
   const makingOfferRef = useRef(false);
   const ignoreOfferRef = useRef(false);
   const isSettingRemoteAnswerPendingRef = useRef(false);
-  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const needsRenegotiationRef = useRef(false);
+  const negotiationTimerRef = useRef<number | null>(null);
+
+  const pendingIncomingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const outgoingIceQueueRef = useRef<RTCIceCandidateInit[]>([]);
+  const gatheredLocalCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const iceFlushTimerRef = useRef<number | null>(null);
+  const watchdogTimersRef = useRef<number[]>([]);
 
   const localVadIntervalRef = useRef<number | null>(null);
   const remoteVadIntervalRef = useRef<number | null>(null);
   const vadCtxRef = useRef<AudioContext | null>(null);
   const lastEmittedSpeakingRef = useRef(false);
 
-  const polite = mySlot === 2;
-
   // Fetch STUN/TURN ICE configuration when connected to a Node.js backend
   useEffect(() => {
-    if (import.meta.env.VITE_TURN_URL) {
-      setHasTurnServer(true);
-    }
     let active = true;
     const baseUrl = getServerUrl();
     fetch(`${baseUrl}/api/ice-config`)
@@ -116,12 +124,40 @@ export function useWebRTCVoice({
         }
       })
       .catch(() => {
-        // Keep default STUN fallback
+        // Keep default STUN/VITE_TURN fallback
       });
     return () => {
       active = false;
     };
   }, []);
+
+  const clearWatchdogTimers = useCallback(() => {
+    watchdogTimersRef.current.forEach((id) => window.clearTimeout(id));
+    watchdogTimersRef.current = [];
+  }, []);
+
+  const flushOutgoingIce = useCallback(() => {
+    if (iceFlushTimerRef.current !== null) {
+      window.clearTimeout(iceFlushTimerRef.current);
+      iceFlushTimerRef.current = null;
+    }
+    if (outgoingIceQueueRef.current.length === 0) return;
+    const batch = outgoingIceQueueRef.current.splice(0, outgoingIceQueueRef.current.length);
+    socket.emit('voice:ice-candidates', { candidates: batch });
+  }, [socket]);
+
+  const queueOutgoingIce = useCallback(
+    (candidate: RTCIceCandidateInit) => {
+      gatheredLocalCandidatesRef.current.push(candidate);
+      outgoingIceQueueRef.current.push(candidate);
+      if (iceFlushTimerRef.current === null) {
+        iceFlushTimerRef.current = window.setTimeout(() => {
+          flushOutgoingIce();
+        }, 160);
+      }
+    },
+    [flushOutgoingIce]
+  );
 
   const stopVadMonitor = useCallback((which: 'local' | 'remote' | 'all') => {
     if (which === 'local' || which === 'all') {
@@ -237,7 +273,53 @@ export function useWebRTCVoice({
       });
   }, []);
 
+  const sendOfferNow = useCallback(
+    async (pc: RTCPeerConnection) => {
+      if (makingOfferRef.current || pc.signalingState !== 'stable') {
+        needsRenegotiationRef.current = true;
+        return;
+      }
+      try {
+        makingOfferRef.current = true;
+        needsRenegotiationRef.current = false;
+        await pc.setLocalDescription();
+        if (pc.localDescription) {
+          socket.emit('voice:offer', { sdp: pc.localDescription.toJSON() });
+        }
+      } catch {
+        // Retry if interrupted
+      } finally {
+        makingOfferRef.current = false;
+      }
+    },
+    [socket]
+  );
+
+  const scheduleNegotiation = useCallback(
+    (pc: RTCPeerConnection) => {
+      if (negotiationTimerRef.current !== null) {
+        window.clearTimeout(negotiationTimerRef.current);
+      }
+      negotiationTimerRef.current = window.setTimeout(() => {
+        negotiationTimerRef.current = null;
+        if (pcRef.current === pc) {
+          void sendOfferNow(pc);
+        }
+      }, 30);
+    },
+    [sendOfferNow]
+  );
+
   const closePeerConnection = useCallback(() => {
+    clearWatchdogTimers();
+    if (negotiationTimerRef.current !== null) {
+      window.clearTimeout(negotiationTimerRef.current);
+      negotiationTimerRef.current = null;
+    }
+    if (iceFlushTimerRef.current !== null) {
+      window.clearTimeout(iceFlushTimerRef.current);
+      iceFlushTimerRef.current = null;
+    }
     if (pcRef.current) {
       pcRef.current.onicecandidate = null;
       pcRef.current.ontrack = null;
@@ -248,16 +330,20 @@ export function useWebRTCVoice({
       pcRef.current = null;
     }
     audioSenderRef.current = null;
-    pendingCandidatesRef.current = [];
+    pendingIncomingCandidatesRef.current = [];
+    outgoingIceQueueRef.current = [];
+    gatheredLocalCandidatesRef.current = [];
     makingOfferRef.current = false;
     ignoreOfferRef.current = false;
     isSettingRemoteAnswerPendingRef.current = false;
+    needsRenegotiationRef.current = false;
+    setVoiceWarning(null);
     stopVadMonitor('remote');
     if (remoteAudioElRef.current) {
       remoteAudioElRef.current.srcObject = null;
     }
     remoteStreamRef.current = null;
-  }, [stopVadMonitor]);
+  }, [clearWatchdogTimers, stopVadMonitor]);
 
   const createPeerConnection = useCallback(() => {
     if (pcRef.current) return pcRef.current;
@@ -268,23 +354,23 @@ export function useWebRTCVoice({
     });
     pcRef.current = pc;
 
-    // Ensure at least a recvonly audio transceiver exists so we can hear opponent
-    // even before we enable our own microphone.
+    // Only Slot 1 (or a peer who already turned on mic) creates the initial audio m-line;
+    // Slot 2 creates its matching transceiver automatically on setRemoteDescription(offer).
     if (localStreamRef.current) {
       const audioTrack = localStreamRef.current.getAudioTracks()[0];
       if (audioTrack) {
         audioSenderRef.current = pc.addTrack(audioTrack, localStreamRef.current);
       }
-    } else {
+    } else if (stateRef.current.mySlot === 1) {
       const transceiver = pc.addTransceiver('audio', { direction: 'recvonly' });
       audioSenderRef.current = transceiver.sender;
     }
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socket.emit('voice:ice-candidate', {
-          candidate: event.candidate.toJSON(),
-        });
+        queueOutgoingIce(event.candidate.toJSON());
+      } else {
+        flushOutgoingIce();
       }
     };
 
@@ -295,54 +381,262 @@ export function useWebRTCVoice({
       startVadMonitor(stream, 'remote');
     };
 
-    pc.onnegotiationneeded = async () => {
-      try {
-        makingOfferRef.current = true;
-        await pc.setLocalDescription();
-        if (pc.localDescription) {
-          socket.emit('voice:offer', { sdp: pc.localDescription.toJSON() });
-        }
-      } catch {
-        // Handled by glare/renegotiation
-      } finally {
-        makingOfferRef.current = false;
+    pc.onnegotiationneeded = () => {
+      // Only negotiate automatically if we're slot 1 or we've actively added a mic track
+      if (stateRef.current.mySlot !== 1 && !localStreamRef.current) {
+        return;
       }
+      scheduleNegotiation(pc);
     };
 
-    pc.oniceconnectionstatechange = () => {
-      const state = pc.iceConnectionState;
-      if (state === 'checking' || state === 'new') {
-        setVoiceStatus('connecting');
-      } else if (state === 'connected' || state === 'completed') {
+    const handleConnectionProgress = () => {
+      const iceState = pc.iceConnectionState;
+      const connState = pc.connectionState;
+
+      if (
+        iceState === 'connected' ||
+        iceState === 'completed' ||
+        connState === 'connected'
+      ) {
+        clearWatchdogTimers();
+        setVoiceWarning(null);
         setVoiceStatus('connected');
-      } else if (state === 'disconnected') {
+        return;
+      }
+
+      if (iceState === 'disconnected' || iceState === 'failed' || connState === 'failed') {
         setVoiceStatus('reconnecting');
         if (typeof pc.restartIce === 'function') {
           pc.restartIce();
+          if (stateRef.current.mySlot === 1 || localStreamRef.current) {
+            scheduleNegotiation(pc);
+          }
         }
-      } else if (state === 'failed') {
-        setVoiceStatus('reconnecting');
-        if (typeof pc.restartIce === 'function') {
-          pc.restartIce();
-        }
-      } else if (state === 'closed') {
+        return;
+      }
+
+      if (iceState === 'closed' || connState === 'closed') {
+        clearWatchdogTimers();
         setVoiceStatus('disconnected');
+        return;
       }
+
+      setVoiceStatus('connecting');
     };
 
-    pc.onconnectionstatechange = () => {
-      const state = pc.connectionState;
-      if (state === 'connected') {
-        setVoiceStatus('connected');
-      } else if (state === 'connecting') {
-        setVoiceStatus('connecting');
-      } else if (state === 'failed') {
-        setVoiceStatus('reconnecting');
-      }
-    };
+    pc.oniceconnectionstatechange = handleConnectionProgress;
+    pc.onconnectionstatechange = handleConnectionProgress;
 
     return pc;
-  }, [ensureRemoteAudioElement, socket, startVadMonitor]);
+  }, [
+    clearWatchdogTimers,
+    ensureRemoteAudioElement,
+    flushOutgoingIce,
+    queueOutgoingIce,
+    scheduleNegotiation,
+    startVadMonitor,
+  ]);
+
+  const startConnectionWatchdog = useCallback(() => {
+    clearWatchdogTimers();
+    const restartTimer = window.setTimeout(() => {
+      const pc = pcRef.current;
+      if (!pc || !stateRef.current.opponentConnected) return;
+      if (
+        pc.iceConnectionState !== 'connected' &&
+        pc.iceConnectionState !== 'completed' &&
+        pc.connectionState !== 'connected'
+      ) {
+        if (typeof pc.restartIce === 'function') {
+          pc.restartIce();
+          if (stateRef.current.mySlot === 1 || localStreamRef.current) {
+            scheduleNegotiation(pc);
+          }
+        }
+      }
+    }, 6000);
+
+    const warnTimer = window.setTimeout(() => {
+      const pc = pcRef.current;
+      if (!pc || !stateRef.current.opponentConnected) return;
+      if (
+        pc.iceConnectionState !== 'connected' &&
+        pc.iceConnectionState !== 'completed' &&
+        pc.connectionState !== 'connected'
+      ) {
+        setVoiceWarning(
+          hasTurnServer
+            ? 'Audio handshake is taking longer than expected. Tap Retry Audio.'
+            : 'Direct peer audio is blocked by one network (no TURN relay configured). Try Wi-Fi or tap Retry Audio.'
+        );
+      }
+    }, 13000);
+
+    watchdogTimersRef.current = [restartTimer, warnTimer];
+  }, [clearWatchdogTimers, hasTurnServer, scheduleNegotiation]);
+
+  // Register WebRTC Signaling listeners persistently BEFORE connection lifecycle runs
+  useEffect(() => {
+    const addCandidateSafe = async (pc: RTCPeerConnection, candidate: RTCIceCandidateInit) => {
+      if (!pc.remoteDescription) {
+        pendingIncomingCandidatesRef.current.push(candidate);
+        return;
+      }
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch {
+        // Ignore stale or incompatible candidate
+      }
+    };
+
+    const flushPendingIncoming = async (pc: RTCPeerConnection) => {
+      const queued = pendingIncomingCandidatesRef.current.splice(
+        0,
+        pendingIncomingCandidatesRef.current.length
+      );
+      for (const candidate of queued) {
+        await pc.addIceCandidate(candidate).catch(() => {});
+      }
+    };
+
+    const handleOffer = async (raw: unknown) => {
+      const payload = raw as { fromPlayerId: string; sdp: RTCSessionDescriptionInit };
+      const { roomCode: activeRoom, myPlayerId: selfId, mySlot: slot } = stateRef.current;
+      if (!payload?.sdp || !activeRoom || payload.fromPlayerId === selfId) return;
+
+      const pc = createPeerConnection();
+      const polite = slot === 2;
+      const readyForOffer =
+        !makingOfferRef.current &&
+        (pc.signalingState === 'stable' || isSettingRemoteAnswerPendingRef.current);
+      const offerCollision = payload.sdp.type === 'offer' && !readyForOffer;
+
+      ignoreOfferRef.current = !polite && offerCollision;
+      if (ignoreOfferRef.current) {
+        return;
+      }
+
+      try {
+        await pc.setRemoteDescription(payload.sdp);
+        await flushPendingIncoming(pc);
+
+        if (payload.sdp.type === 'offer') {
+          await pc.setLocalDescription();
+          if (pc.localDescription) {
+            socket.emit('voice:answer', { sdp: pc.localDescription.toJSON() });
+          }
+        }
+        if (needsRenegotiationRef.current && pc.signalingState === 'stable') {
+          scheduleNegotiation(pc);
+        }
+      } catch {
+        // Ignore transient signaling race
+      }
+    };
+
+    const handleAnswer = async (raw: unknown) => {
+      const payload = raw as { fromPlayerId: string; sdp: RTCSessionDescriptionInit };
+      const { roomCode: activeRoom, myPlayerId: selfId } = stateRef.current;
+      if (!payload?.sdp || !activeRoom || payload.fromPlayerId === selfId) return;
+      const pc = pcRef.current;
+      if (!pc || pc.signalingState !== 'have-local-offer') return;
+
+      try {
+        isSettingRemoteAnswerPendingRef.current = true;
+        await pc.setRemoteDescription(payload.sdp);
+        await flushPendingIncoming(pc);
+        if (
+          needsRenegotiationRef.current &&
+          (pc.signalingState as RTCSignalingState) === 'stable'
+        ) {
+          scheduleNegotiation(pc);
+        }
+      } catch {
+        // Ignore stale answer
+      } finally {
+        isSettingRemoteAnswerPendingRef.current = false;
+      }
+    };
+
+    const handleIceCandidate = async (raw: unknown) => {
+      const payload = raw as { fromPlayerId: string; candidate: RTCIceCandidateInit };
+      const { roomCode: activeRoom, myPlayerId: selfId } = stateRef.current;
+      if (!payload?.candidate || !activeRoom || payload.fromPlayerId === selfId) return;
+      const pc = pcRef.current;
+      if (!pc) {
+        pendingIncomingCandidatesRef.current.push(payload.candidate);
+        return;
+      }
+      await addCandidateSafe(pc, payload.candidate);
+    };
+
+    const handleIceCandidates = async (raw: unknown) => {
+      const payload = raw as { fromPlayerId: string; candidates: RTCIceCandidateInit[] };
+      const { roomCode: activeRoom, myPlayerId: selfId } = stateRef.current;
+      if (
+        !payload ||
+        !Array.isArray(payload.candidates) ||
+        !activeRoom ||
+        payload.fromPlayerId === selfId
+      ) {
+        return;
+      }
+      const pc = pcRef.current;
+      for (const cand of payload.candidates) {
+        if (!pc) {
+          pendingIncomingCandidatesRef.current.push(cand);
+        } else {
+          await addCandidateSafe(pc, cand);
+        }
+      }
+    };
+
+    const handlePeerReady = async () => {
+      const { roomCode: activeRoom, opponentConnected: peerOnline, mySlot: slot } =
+        stateRef.current;
+      if (!activeRoom || !peerOnline) return;
+      const pc = createPeerConnection();
+      if (
+        slot === 1 &&
+        pc.iceConnectionState !== 'connected' &&
+        pc.iceConnectionState !== 'completed'
+      ) {
+        if (pc.signalingState === 'stable') {
+          scheduleNegotiation(pc);
+        } else if (pc.signalingState === 'have-local-offer' && pc.localDescription) {
+          socket.emit('voice:offer', { sdp: pc.localDescription.toJSON() });
+          if (gatheredLocalCandidatesRef.current.length > 0) {
+            socket.emit('voice:ice-candidates', {
+              candidates: gatheredLocalCandidatesRef.current,
+            });
+          }
+        }
+      }
+    };
+
+    const handleOpponentSpeaking = (raw: unknown) => {
+      const payload = raw as { playerId: string; speaking: boolean };
+      if (payload && payload.playerId !== stateRef.current.myPlayerId) {
+        setIsOpponentSpeaking(Boolean(payload.speaking));
+      }
+    };
+
+    socket.on('voice:offer', handleOffer);
+    socket.on('voice:answer', handleAnswer);
+    socket.on('voice:ice-candidate', handleIceCandidate);
+    socket.on('voice:ice-candidates', handleIceCandidates);
+    socket.on('voice:peer-ready', handlePeerReady);
+    socket.on('voice:speaking', handleOpponentSpeaking);
+
+    return () => {
+      socket.off('voice:offer', handleOffer);
+      socket.off('voice:answer', handleAnswer);
+      socket.off('voice:ice-candidate', handleIceCandidate);
+      socket.off('voice:ice-candidates', handleIceCandidates);
+      socket.off('voice:peer-ready', handlePeerReady);
+      socket.off('voice:speaking', handleOpponentSpeaking);
+    };
+  }, [createPeerConnection, scheduleNegotiation, socket]);
 
   // Manage PeerConnection lifecycle based on room & opponent presence
   useEffect(() => {
@@ -359,21 +653,13 @@ export function useWebRTCVoice({
     }
 
     setVoiceStatus('connecting');
+    setVoiceWarning(null);
     const pc = createPeerConnection();
     socket.emit('voice:ready');
+    startConnectionWatchdog();
 
     if (mySlot === 1 && pc.signalingState === 'stable') {
-      makingOfferRef.current = true;
-      pc.setLocalDescription()
-        .then(() => {
-          if (pc.localDescription) {
-            socket.emit('voice:offer', { sdp: pc.localDescription.toJSON() });
-          }
-        })
-        .catch(() => {})
-        .finally(() => {
-          makingOfferRef.current = false;
-        });
+      scheduleNegotiation(pc);
     }
   }, [
     closePeerConnection,
@@ -382,129 +668,31 @@ export function useWebRTCVoice({
     mySlot,
     opponentConnected,
     roomCode,
+    scheduleNegotiation,
     socket,
+    startConnectionWatchdog,
   ]);
 
-  // WebRTC Signaling listeners (Perfect Negotiation)
-  useEffect(() => {
-    const handleOffer = async (raw: unknown) => {
-      const payload = raw as { fromPlayerId: string; sdp: RTCSessionDescriptionInit };
-      if (!payload || !roomCode || payload.fromPlayerId === myPlayerId) return;
-      const pc = createPeerConnection();
-      const description = payload.sdp;
-
-      const readyForOffer =
-        !makingOfferRef.current &&
-        (pc.signalingState === 'stable' || isSettingRemoteAnswerPendingRef.current);
-      const offerCollision = description.type === 'offer' && !readyForOffer;
-
-      ignoreOfferRef.current = !polite && offerCollision;
-      if (ignoreOfferRef.current) {
-        return;
-      }
-
-      try {
-        await pc.setRemoteDescription(description);
-        for (const candidate of pendingCandidatesRef.current) {
-          await pc.addIceCandidate(candidate).catch(() => {});
-        }
-        pendingCandidatesRef.current = [];
-
-        if (description.type === 'offer') {
-          await pc.setLocalDescription();
-          if (pc.localDescription) {
-            socket.emit('voice:answer', { sdp: pc.localDescription.toJSON() });
-          }
-        }
-      } catch {
-        // Ignore transient signaling errors during rapid reconnects
-      }
-    };
-
-    const handleAnswer = async (raw: unknown) => {
-      const payload = raw as { fromPlayerId: string; sdp: RTCSessionDescriptionInit };
-      if (!payload || !roomCode || payload.fromPlayerId === myPlayerId) return;
-      const pc = pcRef.current;
-      if (!pc) return;
-      try {
-        isSettingRemoteAnswerPendingRef.current = true;
-        await pc.setRemoteDescription(payload.sdp);
-        for (const candidate of pendingCandidatesRef.current) {
-          await pc.addIceCandidate(candidate).catch(() => {});
-        }
-        pendingCandidatesRef.current = [];
-      } catch {
-        // Ignore stale answers
-      } finally {
-        isSettingRemoteAnswerPendingRef.current = false;
-      }
-    };
-
-    const handleIceCandidate = async (raw: unknown) => {
-      const payload = raw as { fromPlayerId: string; candidate: RTCIceCandidateInit };
-      if (!payload || !roomCode || payload.fromPlayerId === myPlayerId) return;
-      const pc = pcRef.current;
-      if (!pc || !pc.remoteDescription) {
-        pendingCandidatesRef.current.push(payload.candidate);
-        return;
-      }
-      try {
-        await pc.addIceCandidate(payload.candidate);
-      } catch {
-        if (!ignoreOfferRef.current) {
-          // Ignore malformed/stale candidate
-        }
-      }
-    };
-
-    const handlePeerReady = async () => {
-      if (!roomCode || !opponentConnected) return;
-      const pc = createPeerConnection();
-      // Slot-1 initiates (or re-sends) offer when peer connects/reconnects
-      if (mySlot === 1 && pc.signalingState === 'stable') {
-        try {
-          makingOfferRef.current = true;
-          await pc.setLocalDescription();
-          if (pc.localDescription) {
-            socket.emit('voice:offer', { sdp: pc.localDescription.toJSON() });
-          }
-        } catch {
-          // Ignore
-        } finally {
-          makingOfferRef.current = false;
-        }
-      } else if (
-        mySlot === 1 &&
-        pc.signalingState === 'have-local-offer' &&
-        pc.localDescription &&
-        pc.iceConnectionState !== 'connected' &&
-        pc.iceConnectionState !== 'completed'
-      ) {
-        socket.emit('voice:offer', { sdp: pc.localDescription.toJSON() });
-      }
-    };
-
-    const handleOpponentSpeaking = (raw: unknown) => {
-      const payload = raw as { playerId: string; speaking: boolean };
-      if (payload && payload.playerId !== myPlayerId) {
-        setIsOpponentSpeaking(Boolean(payload.speaking));
-      }
-    };
-
-    socket.on('voice:offer', handleOffer);
-    socket.on('voice:answer', handleAnswer);
-    socket.on('voice:ice-candidate', handleIceCandidate);
-    socket.on('voice:peer-ready', handlePeerReady);
-    socket.on('voice:speaking', handleOpponentSpeaking);
-
-    return () => {
-      socket.off('voice:offer', handleOffer);
-      socket.off('voice:answer', handleAnswer);
-      socket.off('voice:ice-candidate', handleIceCandidate);
-      socket.off('voice:peer-ready', handlePeerReady);
-      socket.off('voice:speaking', handleOpponentSpeaking);
-    };
-  }, [createPeerConnection, myPlayerId, mySlot, opponentConnected, roomCode, socket]);
+  const retryVoiceConnection = useCallback(() => {
+    const { roomCode: activeRoom, opponentConnected: peerOnline, mySlot: slot } =
+      stateRef.current;
+    if (!activeRoom || !peerOnline) return;
+    closePeerConnection();
+    setVoiceStatus('connecting');
+    setVoiceWarning(null);
+    const pc = createPeerConnection();
+    socket.emit('voice:ready');
+    startConnectionWatchdog();
+    if (slot === 1 || localStreamRef.current) {
+      scheduleNegotiation(pc);
+    }
+  }, [
+    closePeerConnection,
+    createPeerConnection,
+    scheduleNegotiation,
+    socket,
+    startConnectionWatchdog,
+  ]);
 
   const enableMicrophone = useCallback(async () => {
     setPermissionError(null);
@@ -524,7 +712,6 @@ export function useWebRTCVoice({
         video: false,
       });
 
-      // Stop any previous local tracks
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((t) => t.stop());
       }
@@ -544,32 +731,34 @@ export function useWebRTCVoice({
       if (pcRef.current && audioTrack) {
         const pc = pcRef.current;
         const transceivers = pc.getTransceivers();
-        const audioTransceiver = transceivers.find(
-          (t) =>
-            t.sender === audioSenderRef.current ||
-            t.receiver.track?.kind === 'audio'
-        );
+        // Prefer the already-negotiated transceiver (mid !== null) or matching audio transceiver
+        const audioTransceiver =
+          transceivers.find(
+            (t) =>
+              t.mid !== null &&
+              (t.receiver.track?.kind === 'audio' || t.sender === audioSenderRef.current)
+          ) ??
+          transceivers.find(
+            (t) =>
+              t.sender === audioSenderRef.current || t.receiver.track?.kind === 'audio'
+          );
 
         if (audioTransceiver) {
           audioTransceiver.direction = 'sendrecv';
           await audioTransceiver.sender.replaceTrack(audioTrack);
           audioSenderRef.current = audioTransceiver.sender;
-          // Explicitly renegotiate because replaceTrack alone does not fire onnegotiationneeded when direction changes
-          if (pc.signalingState === 'stable') {
-            makingOfferRef.current = true;
-            try {
-              await pc.setLocalDescription();
-              if (pc.localDescription) {
-                socket.emit('voice:offer', {
-                  sdp: pc.localDescription.toJSON(),
-                });
-              }
-            } finally {
-              makingOfferRef.current = false;
-            }
-          }
+          scheduleNegotiation(pc);
         } else {
           audioSenderRef.current = pc.addTrack(audioTrack, stream);
+          scheduleNegotiation(pc);
+        }
+
+        if (
+          pc.iceConnectionState !== 'connected' &&
+          pc.iceConnectionState !== 'completed' &&
+          pc.connectionState !== 'connected'
+        ) {
+          startConnectionWatchdog();
         }
       }
     } catch (err) {
@@ -589,7 +778,7 @@ export function useWebRTCVoice({
         );
       }
     }
-  }, [socket, startVadMonitor]);
+  }, [scheduleNegotiation, socket, startConnectionWatchdog, startVadMonitor]);
 
   const disableMicrophone = useCallback(() => {
     stopVadMonitor('local');
@@ -640,6 +829,7 @@ export function useWebRTCVoice({
     setMicEnabled(false);
     setMicMuted(false);
     setVoiceStatus('idle');
+    setVoiceWarning(null);
     setAudioPlaybackBlocked(false);
   }, [closePeerConnection, stopVadMonitor]);
 
@@ -655,6 +845,7 @@ export function useWebRTCVoice({
     permissionState,
     permissionError,
     voiceStatus,
+    voiceWarning,
     isSelfSpeaking,
     isOpponentSpeaking,
     hasTurnServer,
@@ -663,6 +854,7 @@ export function useWebRTCVoice({
     disableMicrophone,
     toggleMute,
     resumeRemoteAudio,
+    retryVoiceConnection,
     teardownVoice,
   };
 }

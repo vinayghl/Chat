@@ -40,6 +40,18 @@ export function registerVoiceSignalingHandlers(socket: Socket): void {
     });
   });
 
+  socket.on('voice:ice-candidates', (payload: { candidates?: unknown }) => {
+    const membership = getMembershipBySocket(socket.id);
+    if (!membership || !payload || !Array.isArray(payload.candidates) || payload.candidates.length === 0) {
+      return;
+    }
+    const { room, player } = membership;
+    socket.to(room.roomCode).emit('voice:ice-candidates', {
+      fromPlayerId: player.playerId,
+      candidates: payload.candidates.slice(0, 40),
+    });
+  });
+
   socket.on(
     'voice:state',
     (payload: { micEnabled?: boolean; micMuted?: boolean }) => {
