@@ -89,4 +89,22 @@ export function registerVoiceSignalingHandlers(socket: Socket): void {
       playerId: player.playerId,
     });
   });
+
+  socket.on('voice:audio-chunk', (payload: { d?: unknown }) => {
+    const membership = getMembershipBySocket(socket.id);
+    if (
+      !membership ||
+      !payload ||
+      typeof payload.d !== 'string' ||
+      payload.d.length === 0 ||
+      payload.d.length > 16000
+    ) {
+      return;
+    }
+    const { room, player } = membership;
+    socket.to(room.roomCode).emit('voice:audio-chunk', {
+      fromPlayerId: player.playerId,
+      d: payload.d,
+    });
+  });
 }

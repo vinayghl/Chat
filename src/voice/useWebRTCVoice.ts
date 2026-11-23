@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { IceConfigResponse, PlayerSlot } from '../shared/gameConstants.ts';
 import { getServerUrl, type RealtimeClient } from '../socket/socketClient.ts';
+import {
+  VOICE_RELAY_SAMPLE_RATE,
+  WssVoiceRelay,
+  computeRms,
+  decodeMulawBase64,
+  encodeMulawBase64,
+} from './audioCodecAndRelay.ts';
 
 export type VoiceConnectionStatus =
   | 'idle'
@@ -90,6 +97,8 @@ export function useWebRTCVoice({
   const stateRef = useRef({ roomCode, myPlayerId, mySlot, opponentConnected });
   stateRef.current = { roomCode, myPlayerId, mySlot, opponentConnected };
 
+  const micActiveRef = useRef({ enabled: false, muted: false });
+
   const makingOfferRef = useRef(false);
   const ignoreOfferRef = useRef(false);
   const isSettingRemoteAnswerPendingRef = useRef(false);
@@ -107,7 +116,25 @@ export function useWebRTCVoice({
   const vadCtxRef = useRef<AudioContext | null>(null);
   const lastEmittedSpeakingRef = useRef(false);
 
-  // Fetch STUN/TURN ICE configuration when connected to a Node.js backend
+  // Automatic zero-config WSS/Socket audio relay fallback when direct WebRTC ICE is blocked by NAT
+  const webrtcConnectedRef = useRef(false);
+  const relayActiveRef = useRef(false);
+  const relayConnectedRef = useRef(false);
+  const wssRelayRef = useRef<WssVoiceRelay | null>(null);
+  const relayActivationTimerRef = useRef<number | null>(null);
+
+  const captureCtxRef = useRef<AudioContext | null>(null);
+  const captureSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const captureProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const captureSilentGainRef = useRef<GainNode | null>(null);
+  const captureChunksRef = useRef<Float32Array[]>([]);
+  const captureSampleCountRef = useRef(0);
+  const captureHangoverRef = useRef(0);
+
+  const playbackCtxRef = useRef<AudioContext | null>(null);
+  const nextPlayTimeRef = useRef(0);
+  const opponentSpeakingTimerRef = useRef<number | null>(null);
+
   useEffect(() => {
     let active = true;
     const baseUrl = getServerUrl();
@@ -124,12 +151,270 @@ export function useWebRTCVoice({
         }
       })
       .catch(() => {
-        // Keep default STUN/VITE_TURN fallback
+        // Keep STUN fallback
       });
     return () => {
       active = false;
     };
   }, []);
+
+  const getAudioCtxCtor = () =>
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext })
+      .webkitAudioContext;
+
+  const ensurePlaybackCtx = useCallback((): AudioContext | null => {
+    if (typeof window === 'undefined') return null;
+    const Ctor = getAudioCtxCtor();
+    if (!Ctor) return null;
+    if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
+      playbackCtxRef.current = new Ctor();
+      nextPlayTimeRef.current = 0;
+    }
+    if (playbackCtxRef.current.state === 'suspended') {
+      void playbackCtxRef.current
+        .resume()
+        .then(() => {
+          setAudioPlaybackBlocked(false);
+        })
+        .catch(() => {
+          setAudioPlaybackBlocked(true);
+        });
+    }
+    return playbackCtxRef.current;
+  }, []);
+
+  const playRelayedAudioChunk = useCallback(
+    (b64: string) => {
+      if (webrtcConnectedRef.current || !relayActiveRef.current) return;
+      const ctx = ensurePlaybackCtx();
+      if (!ctx) return;
+
+      if (ctx.state === 'suspended') {
+        setAudioPlaybackBlocked(true);
+        void ctx.resume().then(() => setAudioPlaybackBlocked(false)).catch(() => {});
+      }
+
+      let samples: Float32Array;
+      try {
+        samples = decodeMulawBase64(b64);
+      } catch {
+        return;
+      }
+      if (samples.length === 0) return;
+
+      const buffer = ctx.createBuffer(1, samples.length, VOICE_RELAY_SAMPLE_RATE);
+      buffer.getChannelData(0).set(samples);
+
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      if (nextPlayTimeRef.current < now + 0.02 || nextPlayTimeRef.current > now + 0.6) {
+        nextPlayTimeRef.current = now + 0.05;
+      }
+      src.start(nextPlayTimeRef.current);
+      nextPlayTimeRef.current += buffer.duration;
+
+      setIsOpponentSpeaking(true);
+      if (opponentSpeakingTimerRef.current !== null) {
+        window.clearTimeout(opponentSpeakingTimerRef.current);
+      }
+      opponentSpeakingTimerRef.current = window.setTimeout(() => {
+        setIsOpponentSpeaking(false);
+      }, 450);
+    },
+    [ensurePlaybackCtx]
+  );
+
+  const stopRelayCapture = useCallback(() => {
+    if (captureProcessorRef.current) {
+      captureProcessorRef.current.onaudioprocess = null;
+      try {
+        captureProcessorRef.current.disconnect();
+      } catch {
+        // Ignore
+      }
+      captureProcessorRef.current = null;
+    }
+    if (captureSourceRef.current) {
+      try {
+        captureSourceRef.current.disconnect();
+      } catch {
+        // Ignore
+      }
+      captureSourceRef.current = null;
+    }
+    if (captureSilentGainRef.current) {
+      try {
+        captureSilentGainRef.current.disconnect();
+      } catch {
+        // Ignore
+      }
+      captureSilentGainRef.current = null;
+    }
+    if (captureCtxRef.current && captureCtxRef.current.state !== 'closed') {
+      void captureCtxRef.current.close().catch(() => {});
+      captureCtxRef.current = null;
+    }
+    captureChunksRef.current = [];
+    captureSampleCountRef.current = 0;
+    captureHangoverRef.current = 0;
+  }, []);
+
+  const startRelayCapture = useCallback(() => {
+    const stream = localStreamRef.current;
+    if (!stream || !relayActiveRef.current || webrtcConnectedRef.current) return;
+    if (captureProcessorRef.current) return;
+
+    const Ctor = getAudioCtxCtor();
+    if (!Ctor) return;
+
+    try {
+      const ctx = new Ctor();
+      if (ctx.state === 'suspended') {
+        void ctx.resume().catch(() => {});
+      }
+      captureCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      captureSourceRef.current = source;
+
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      captureProcessorRef.current = processor;
+
+      // Connect through a zero-gain node so browsers keep firing onaudioprocess without local echo
+      const silentGain = ctx.createGain();
+      silentGain.gain.value = 0;
+      captureSilentGainRef.current = silentGain;
+
+      const targetChunkSamples = Math.max(2048, Math.round(ctx.sampleRate * 0.18));
+
+      processor.onaudioprocess = (ev) => {
+        if (
+          !relayActiveRef.current ||
+          webrtcConnectedRef.current ||
+          !micActiveRef.current.enabled ||
+          micActiveRef.current.muted
+        ) {
+          return;
+        }
+        const input = ev.inputBuffer.getChannelData(0);
+        const rms = computeRms(input);
+        if (rms > 0.0035) {
+          captureHangoverRef.current = 4;
+        } else if (captureHangoverRef.current > 0) {
+          captureHangoverRef.current -= 1;
+        } else {
+          captureChunksRef.current = [];
+          captureSampleCountRef.current = 0;
+          return;
+        }
+
+        const copy = new Float32Array(input.length);
+        copy.set(input);
+        captureChunksRef.current.push(copy);
+        captureSampleCountRef.current += copy.length;
+
+        if (captureSampleCountRef.current >= targetChunkSamples) {
+          const merged = new Float32Array(captureSampleCountRef.current);
+          let offset = 0;
+          for (const chunk of captureChunksRef.current) {
+            merged.set(chunk, offset);
+            offset += chunk.length;
+          }
+          captureChunksRef.current = [];
+          captureSampleCountRef.current = 0;
+
+          const b64 = encodeMulawBase64(merged, ctx.sampleRate);
+          if (socket.mode === 'socket') {
+            socket.emit('voice:audio-chunk', { d: b64 });
+          } else {
+            wssRelayRef.current?.sendAudio(b64);
+          }
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(ctx.destination);
+    } catch {
+      // Ignore capture errors
+    }
+  }, [socket]);
+
+  const stopRelayFallback = useCallback(() => {
+    if (relayActivationTimerRef.current !== null) {
+      window.clearTimeout(relayActivationTimerRef.current);
+      relayActivationTimerRef.current = null;
+    }
+    relayActiveRef.current = false;
+    relayConnectedRef.current = false;
+    stopRelayCapture();
+    if (wssRelayRef.current) {
+      wssRelayRef.current.close();
+      wssRelayRef.current = null;
+    }
+    if (remoteAudioElRef.current) {
+      remoteAudioElRef.current.muted = false;
+    }
+  }, [stopRelayCapture]);
+
+  const activateRelayFallback = useCallback(async () => {
+    const { roomCode: activeRoom, mySlot: slot, opponentConnected: peerOnline } =
+      stateRef.current;
+    if (!activeRoom || !slot || !peerOnline || webrtcConnectedRef.current) return;
+    if (relayActiveRef.current) {
+      if (micActiveRef.current.enabled) {
+        startRelayCapture();
+      }
+      return;
+    }
+
+    relayActiveRef.current = true;
+    if (remoteAudioElRef.current) {
+      remoteAudioElRef.current.muted = true;
+    }
+
+    if (socket.mode === 'socket') {
+      relayConnectedRef.current = socket.connected;
+      if (socket.connected) {
+        setVoiceWarning(null);
+        setVoiceStatus('connected');
+      }
+      if (micActiveRef.current.enabled) {
+        startRelayCapture();
+      }
+      return;
+    }
+
+    const relay = new WssVoiceRelay(
+      (b64) => {
+        playRelayedAudioChunk(b64);
+      },
+      (connected) => {
+        relayConnectedRef.current = connected;
+        if (!webrtcConnectedRef.current && relayActiveRef.current) {
+          if (connected) {
+            setVoiceWarning(null);
+            setVoiceStatus('connected');
+          } else {
+            setVoiceStatus('reconnecting');
+          }
+        }
+      }
+    );
+    wssRelayRef.current = relay;
+    const ok = await relay.connect(activeRoom, slot);
+    if (ok && relayActiveRef.current && !webrtcConnectedRef.current) {
+      relayConnectedRef.current = true;
+      setVoiceWarning(null);
+      setVoiceStatus('connected');
+      if (micActiveRef.current.enabled) {
+        startRelayCapture();
+      }
+    }
+  }, [playRelayedAudioChunk, socket.connected, socket.mode, startRelayCapture]);
 
   const clearWatchdogTimers = useCallback(() => {
     watchdogTimersRef.current.forEach((id) => window.clearTimeout(id));
@@ -179,10 +464,7 @@ export function useWebRTCVoice({
   const startVadMonitor = useCallback(
     (stream: MediaStream, kind: 'local' | 'remote') => {
       if (typeof window === 'undefined') return;
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext })
-          .webkitAudioContext;
+      const AudioCtx = getAudioCtxCtor();
       if (!AudioCtx) return;
 
       stopVadMonitor(kind);
@@ -220,7 +502,7 @@ export function useWebRTCVoice({
               lastEmittedSpeakingRef.current = effectiveSpeaking;
               socket.emit('voice:speaking', { speaking: effectiveSpeaking });
             }
-          } else {
+          } else if (!relayActiveRef.current) {
             setIsOpponentSpeaking(speaking);
           }
         }, 120);
@@ -242,11 +524,13 @@ export function useWebRTCVoice({
       const audio = document.createElement('audio');
       audio.autoplay = true;
       audio.setAttribute('playsinline', 'true');
+      audio.volume = 1;
       audio.style.display = 'none';
       document.body.appendChild(audio);
       remoteAudioElRef.current = audio;
     }
     const audioEl = remoteAudioElRef.current;
+    audioEl.muted = relayActiveRef.current && !webrtcConnectedRef.current;
     if (audioEl.srcObject !== stream) {
       audioEl.srcObject = stream;
     }
@@ -260,18 +544,60 @@ export function useWebRTCVoice({
       });
   }, []);
 
+  const attachReceiverTracks = useCallback(
+    (pc: RTCPeerConnection) => {
+      const tracks = pc
+        .getReceivers()
+        .map((r) => r.track)
+        .filter((t): t is MediaStreamTrack => Boolean(t && t.kind === 'audio'));
+      if (tracks.length === 0) return;
+
+      const stream =
+        remoteStreamRef.current &&
+        remoteStreamRef.current.getAudioTracks().some((t) => tracks.includes(t))
+          ? remoteStreamRef.current
+          : new MediaStream([tracks[0]]);
+      remoteStreamRef.current = stream;
+      ensureRemoteAudioElement(stream);
+      startVadMonitor(stream, 'remote');
+    },
+    [ensureRemoteAudioElement, startVadMonitor]
+  );
+
   const resumeRemoteAudio = useCallback(() => {
     const audioEl = remoteAudioElRef.current;
-    if (!audioEl) return;
-    audioEl
-      .play()
-      .then(() => {
-        setAudioPlaybackBlocked(false);
-      })
-      .catch(() => {
-        setAudioPlaybackBlocked(true);
-      });
+    if (audioEl) {
+      audioEl
+        .play()
+        .then(() => {
+          setAudioPlaybackBlocked(false);
+        })
+        .catch(() => {
+          setAudioPlaybackBlocked(true);
+        });
+    }
+    if (playbackCtxRef.current && playbackCtxRef.current.state === 'suspended') {
+      void playbackCtxRef.current
+        .resume()
+        .then(() => setAudioPlaybackBlocked(false))
+        .catch(() => {});
+    }
+    if (vadCtxRef.current && vadCtxRef.current.state === 'suspended') {
+      void vadCtxRef.current.resume().catch(() => {});
+    }
   }, []);
+
+  // Automatically unlock audio playback on any user interaction on the page
+  useEffect(() => {
+    if (typeof window === 'undefined' || !audioPlaybackBlocked) return;
+    const onGesture = () => {
+      resumeRemoteAudio();
+    };
+    window.addEventListener('pointerdown', onGesture, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', onGesture);
+    };
+  }, [audioPlaybackBlocked, resumeRemoteAudio]);
 
   const sendOfferNow = useCallback(
     async (pc: RTCPeerConnection) => {
@@ -312,6 +638,8 @@ export function useWebRTCVoice({
 
   const closePeerConnection = useCallback(() => {
     clearWatchdogTimers();
+    webrtcConnectedRef.current = false;
+    stopRelayFallback();
     if (negotiationTimerRef.current !== null) {
       window.clearTimeout(negotiationTimerRef.current);
       negotiationTimerRef.current = null;
@@ -343,7 +671,7 @@ export function useWebRTCVoice({
       remoteAudioElRef.current.srcObject = null;
     }
     remoteStreamRef.current = null;
-  }, [clearWatchdogTimers, stopVadMonitor]);
+  }, [clearWatchdogTimers, stopRelayFallback, stopVadMonitor]);
 
   const createPeerConnection = useCallback(() => {
     if (pcRef.current) return pcRef.current;
@@ -354,8 +682,6 @@ export function useWebRTCVoice({
     });
     pcRef.current = pc;
 
-    // Only Slot 1 (or a peer who already turned on mic) creates the initial audio m-line;
-    // Slot 2 creates its matching transceiver automatically on setRemoteDescription(offer).
     if (localStreamRef.current) {
       const audioTrack = localStreamRef.current.getAudioTracks()[0];
       if (audioTrack) {
@@ -379,10 +705,12 @@ export function useWebRTCVoice({
       remoteStreamRef.current = stream;
       ensureRemoteAudioElement(stream);
       startVadMonitor(stream, 'remote');
+      event.track.onunmute = () => {
+        ensureRemoteAudioElement(stream);
+      };
     };
 
     pc.onnegotiationneeded = () => {
-      // Only negotiate automatically if we're slot 1 or we've actively added a mic track
       if (stateRef.current.mySlot !== 1 && !localStreamRef.current) {
         return;
       }
@@ -399,13 +727,21 @@ export function useWebRTCVoice({
         connState === 'connected'
       ) {
         clearWatchdogTimers();
+        webrtcConnectedRef.current = true;
+        stopRelayFallback();
+        attachReceiverTracks(pc);
         setVoiceWarning(null);
         setVoiceStatus('connected');
         return;
       }
 
+      webrtcConnectedRef.current = false;
+
       if (iceState === 'disconnected' || iceState === 'failed' || connState === 'failed') {
-        setVoiceStatus('reconnecting');
+        if (!relayConnectedRef.current) {
+          setVoiceStatus('reconnecting');
+        }
+        void activateRelayFallback();
         if (typeof pc.restartIce === 'function') {
           pc.restartIce();
           if (stateRef.current.mySlot === 1 || localStreamRef.current) {
@@ -417,11 +753,15 @@ export function useWebRTCVoice({
 
       if (iceState === 'closed' || connState === 'closed') {
         clearWatchdogTimers();
-        setVoiceStatus('disconnected');
+        if (!relayConnectedRef.current) {
+          setVoiceStatus('disconnected');
+        }
         return;
       }
 
-      setVoiceStatus('connecting');
+      if (!relayConnectedRef.current) {
+        setVoiceStatus('connecting');
+      }
     };
 
     pc.oniceconnectionstatechange = handleConnectionProgress;
@@ -429,53 +769,55 @@ export function useWebRTCVoice({
 
     return pc;
   }, [
+    activateRelayFallback,
+    attachReceiverTracks,
     clearWatchdogTimers,
     ensureRemoteAudioElement,
     flushOutgoingIce,
     queueOutgoingIce,
     scheduleNegotiation,
     startVadMonitor,
+    stopRelayFallback,
   ]);
 
   const startConnectionWatchdog = useCallback(() => {
     clearWatchdogTimers();
+    if (relayActivationTimerRef.current !== null) {
+      window.clearTimeout(relayActivationTimerRef.current);
+    }
+
+    // Activate automatic WSS voice relay if WebRTC ICE hasn't connected within 3.5s
+    relayActivationTimerRef.current = window.setTimeout(() => {
+      relayActivationTimerRef.current = null;
+      if (!webrtcConnectedRef.current && stateRef.current.opponentConnected) {
+        void activateRelayFallback();
+      }
+    }, 3500);
+
     const restartTimer = window.setTimeout(() => {
       const pc = pcRef.current;
       if (!pc || !stateRef.current.opponentConnected) return;
-      if (
-        pc.iceConnectionState !== 'connected' &&
-        pc.iceConnectionState !== 'completed' &&
-        pc.connectionState !== 'connected'
-      ) {
-        if (typeof pc.restartIce === 'function') {
-          pc.restartIce();
-          if (stateRef.current.mySlot === 1 || localStreamRef.current) {
-            scheduleNegotiation(pc);
-          }
+      if (!webrtcConnectedRef.current && typeof pc.restartIce === 'function') {
+        pc.restartIce();
+        if (stateRef.current.mySlot === 1 || localStreamRef.current) {
+          scheduleNegotiation(pc);
         }
       }
-    }, 6000);
+    }, 7000);
 
     const warnTimer = window.setTimeout(() => {
-      const pc = pcRef.current;
-      if (!pc || !stateRef.current.opponentConnected) return;
-      if (
-        pc.iceConnectionState !== 'connected' &&
-        pc.iceConnectionState !== 'completed' &&
-        pc.connectionState !== 'connected'
-      ) {
+      if (!stateRef.current.opponentConnected) return;
+      if (!webrtcConnectedRef.current && !relayConnectedRef.current) {
         setVoiceWarning(
-          hasTurnServer
-            ? 'Audio handshake is taking longer than expected. Tap Retry Audio.'
-            : 'Direct peer audio is blocked by one network (no TURN relay configured). Try Wi-Fi or tap Retry Audio.'
+          'Audio connection is taking longer than expected. Tap Retry Audio.'
         );
       }
-    }, 13000);
+    }, 12000);
 
     watchdogTimersRef.current = [restartTimer, warnTimer];
-  }, [clearWatchdogTimers, hasTurnServer, scheduleNegotiation]);
+  }, [activateRelayFallback, clearWatchdogTimers, scheduleNegotiation]);
 
-  // Register WebRTC Signaling listeners persistently BEFORE connection lifecycle runs
+  // Register Signaling listeners persistently BEFORE connection lifecycle runs
   useEffect(() => {
     const addCandidateSafe = async (pc: RTCPeerConnection, candidate: RTCIceCandidateInit) => {
       if (!pc.remoteDescription) {
@@ -526,6 +868,7 @@ export function useWebRTCVoice({
             socket.emit('voice:answer', { sdp: pc.localDescription.toJSON() });
           }
         }
+        attachReceiverTracks(pc);
         if (needsRenegotiationRef.current && pc.signalingState === 'stable') {
           scheduleNegotiation(pc);
         }
@@ -545,6 +888,7 @@ export function useWebRTCVoice({
         isSettingRemoteAnswerPendingRef.current = true;
         await pc.setRemoteDescription(payload.sdp);
         await flushPendingIncoming(pc);
+        attachReceiverTracks(pc);
         if (
           needsRenegotiationRef.current &&
           (pc.signalingState as RTCSignalingState) === 'stable'
@@ -596,11 +940,7 @@ export function useWebRTCVoice({
         stateRef.current;
       if (!activeRoom || !peerOnline) return;
       const pc = createPeerConnection();
-      if (
-        slot === 1 &&
-        pc.iceConnectionState !== 'connected' &&
-        pc.iceConnectionState !== 'completed'
-      ) {
+      if (slot === 1 && !webrtcConnectedRef.current) {
         if (pc.signalingState === 'stable') {
           scheduleNegotiation(pc);
         } else if (pc.signalingState === 'have-local-offer' && pc.localDescription) {
@@ -621,12 +961,24 @@ export function useWebRTCVoice({
       }
     };
 
+    const handleSocketAudioChunk = (raw: unknown) => {
+      const payload = raw as { fromPlayerId?: string; d?: string };
+      if (
+        payload &&
+        typeof payload.d === 'string' &&
+        payload.fromPlayerId !== stateRef.current.myPlayerId
+      ) {
+        playRelayedAudioChunk(payload.d);
+      }
+    };
+
     socket.on('voice:offer', handleOffer);
     socket.on('voice:answer', handleAnswer);
     socket.on('voice:ice-candidate', handleIceCandidate);
     socket.on('voice:ice-candidates', handleIceCandidates);
     socket.on('voice:peer-ready', handlePeerReady);
     socket.on('voice:speaking', handleOpponentSpeaking);
+    socket.on('voice:audio-chunk', handleSocketAudioChunk);
 
     return () => {
       socket.off('voice:offer', handleOffer);
@@ -635,8 +987,15 @@ export function useWebRTCVoice({
       socket.off('voice:ice-candidates', handleIceCandidates);
       socket.off('voice:peer-ready', handlePeerReady);
       socket.off('voice:speaking', handleOpponentSpeaking);
+      socket.off('voice:audio-chunk', handleSocketAudioChunk);
     };
-  }, [createPeerConnection, scheduleNegotiation, socket]);
+  }, [
+    attachReceiverTracks,
+    createPeerConnection,
+    playRelayedAudioChunk,
+    scheduleNegotiation,
+    socket,
+  ]);
 
   // Manage PeerConnection lifecycle based on room & opponent presence
   useEffect(() => {
@@ -677,6 +1036,7 @@ export function useWebRTCVoice({
     const { roomCode: activeRoom, opponentConnected: peerOnline, mySlot: slot } =
       stateRef.current;
     if (!activeRoom || !peerOnline) return;
+    resumeRemoteAudio();
     closePeerConnection();
     setVoiceStatus('connecting');
     setVoiceWarning(null);
@@ -689,6 +1049,7 @@ export function useWebRTCVoice({
   }, [
     closePeerConnection,
     createPeerConnection,
+    resumeRemoteAudio,
     scheduleNegotiation,
     socket,
     startConnectionWatchdog,
@@ -696,6 +1057,10 @@ export function useWebRTCVoice({
 
   const enableMicrophone = useCallback(async () => {
     setPermissionError(null);
+    // Unlock remote audio contexts immediately inside the user tap gesture
+    ensurePlaybackCtx();
+    resumeRemoteAudio();
+
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setPermissionState('error');
       setPermissionError('Microphone access is unavailable in this browser.');
@@ -722,16 +1087,23 @@ export function useWebRTCVoice({
         audioTrack.enabled = true;
       }
 
+      micActiveRef.current = { enabled: true, muted: false };
       setPermissionState('granted');
       setMicEnabled(true);
       setMicMuted(false);
       startVadMonitor(stream, 'local');
       socket.emit('voice:state', { micEnabled: true, micMuted: false });
 
+      if (relayActiveRef.current && !webrtcConnectedRef.current) {
+        startRelayCapture();
+      } else if (stateRef.current.opponentConnected && !webrtcConnectedRef.current) {
+        // Ensure relay fallback spins up quickly if WebRTC ICE isn't connected yet
+        void activateRelayFallback();
+      }
+
       if (pcRef.current && audioTrack) {
         const pc = pcRef.current;
         const transceivers = pc.getTransceivers();
-        // Prefer the already-negotiated transceiver (mid !== null) or matching audio transceiver
         const audioTransceiver =
           transceivers.find(
             (t) =>
@@ -753,11 +1125,7 @@ export function useWebRTCVoice({
           scheduleNegotiation(pc);
         }
 
-        if (
-          pc.iceConnectionState !== 'connected' &&
-          pc.iceConnectionState !== 'completed' &&
-          pc.connectionState !== 'connected'
-        ) {
+        if (!webrtcConnectedRef.current) {
           startConnectionWatchdog();
         }
       }
@@ -778,10 +1146,21 @@ export function useWebRTCVoice({
         );
       }
     }
-  }, [scheduleNegotiation, socket, startConnectionWatchdog, startVadMonitor]);
+  }, [
+    activateRelayFallback,
+    ensurePlaybackCtx,
+    resumeRemoteAudio,
+    scheduleNegotiation,
+    socket,
+    startConnectionWatchdog,
+    startRelayCapture,
+    startVadMonitor,
+  ]);
 
   const disableMicrophone = useCallback(() => {
     stopVadMonitor('local');
+    stopRelayCapture();
+    micActiveRef.current = { enabled: false, muted: false };
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
@@ -794,11 +1173,13 @@ export function useWebRTCVoice({
     lastEmittedSpeakingRef.current = false;
     socket.emit('voice:speaking', { speaking: false });
     socket.emit('voice:state', { micEnabled: false, micMuted: false });
-  }, [socket, stopVadMonitor]);
+  }, [socket, stopRelayCapture, stopVadMonitor]);
 
   const toggleMute = useCallback(() => {
     if (!localStreamRef.current) return;
+    resumeRemoteAudio();
     const nextMuted = !micMuted;
+    micActiveRef.current = { enabled: true, muted: nextMuted };
     localStreamRef.current.getAudioTracks().forEach((track) => {
       track.enabled = !nextMuted;
     });
@@ -809,10 +1190,16 @@ export function useWebRTCVoice({
       socket.emit('voice:speaking', { speaking: false });
     }
     socket.emit('voice:state', { micEnabled: true, micMuted: nextMuted });
-  }, [micMuted, socket]);
+  }, [micMuted, resumeRemoteAudio, socket]);
 
   const teardownVoice = useCallback(() => {
     stopVadMonitor('all');
+    stopRelayFallback();
+    micActiveRef.current = { enabled: false, muted: false };
+    if (opponentSpeakingTimerRef.current !== null) {
+      window.clearTimeout(opponentSpeakingTimerRef.current);
+      opponentSpeakingTimerRef.current = null;
+    }
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
@@ -826,12 +1213,16 @@ export function useWebRTCVoice({
       void vadCtxRef.current.close().catch(() => {});
       vadCtxRef.current = null;
     }
+    if (playbackCtxRef.current && playbackCtxRef.current.state !== 'closed') {
+      void playbackCtxRef.current.close().catch(() => {});
+      playbackCtxRef.current = null;
+    }
     setMicEnabled(false);
     setMicMuted(false);
     setVoiceStatus('idle');
     setVoiceWarning(null);
     setAudioPlaybackBlocked(false);
-  }, [closePeerConnection, stopVadMonitor]);
+  }, [closePeerConnection, stopRelayFallback, stopVadMonitor]);
 
   useEffect(() => {
     return () => {
