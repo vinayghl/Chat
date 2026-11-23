@@ -6,6 +6,7 @@ import { HowToPlayModal } from './HowToPlayModal.tsx';
 
 interface HomeScreenProps {
   socketConnected: boolean;
+  connectionMode: 'socket' | 'p2p';
   connectionError: string | null;
   onRetryConnection: () => void;
   initialRoomCode: string;
@@ -17,6 +18,7 @@ interface HomeScreenProps {
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
   socketConnected,
+  connectionMode,
   connectionError,
   onRetryConnection,
   initialRoomCode,
@@ -90,7 +92,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           {socketConnected ? (
             <>
               <Wifi className="w-3.5 h-3.5 text-emerald-400" />
-              <span className="hidden sm:inline">Server Ready</span>
+              <span className="hidden sm:inline">
+                {connectionMode === 'p2p' ? 'P2P Ready' : 'Server Ready'}
+              </span>
             </>
           ) : (
             <button

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Socket } from 'socket.io-client';
 import type { IceConfigResponse, PlayerSlot } from '../shared/gameConstants.ts';
-import { getServerUrl } from '../socket/socketClient.ts';
+import { getServerUrl, type RealtimeClient } from '../socket/socketClient.ts';
 
 export type VoiceConnectionStatus =
   | 'idle'
@@ -14,7 +13,7 @@ export type VoiceConnectionStatus =
 export type MicPermissionState = 'prompt' | 'granted' | 'denied' | 'error';
 
 interface UseWebRTCVoiceOptions {
-  socket: Socket;
+  socket: RealtimeClient;
   roomCode: string | null;
   myPlayerId: string | null;
   mySlot: PlayerSlot | null;
@@ -61,7 +60,14 @@ export function useWebRTCVoice({
   const remoteAudioElRef = useRef<HTMLAudioElement | null>(null);
   const audioSenderRef = useRef<RTCRtpSender | null>(null);
   const iceConfigRef = useRef<RTCIceServer[]>([
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+        'stun:stun3.l.google.com:19302',
+      ],
+    },
   ]);
 
   const makingOfferRef = useRef(false);
@@ -76,14 +82,18 @@ export function useWebRTCVoice({
 
   const polite = mySlot === 2;
 
-  // Fetch STUN/TURN ICE configuration once on mount
+  // Fetch STUN/TURN ICE configuration when connected to a Node.js backend
   useEffect(() => {
     let active = true;
     const baseUrl = getServerUrl();
     fetch(`${baseUrl}/api/ice-config`)
-      .then((res) => res.json())
-      .then((data: IceConfigResponse) => {
-        if (active && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+      .then(async (res) => {
+        const ct = res.headers.get('content-type') ?? '';
+        if (!res.ok || !ct.includes('application/json')) return null;
+        return (await res.json()) as IceConfigResponse;
+      })
+      .then((data) => {
+        if (active && data && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
           iceConfigRef.current = data.iceServers;
           setHasTurnServer(Boolean(data.hasTurn));
         }
@@ -358,13 +368,11 @@ export function useWebRTCVoice({
     socket,
   ]);
 
-  // Socket.IO WebRTC Signaling listeners (Perfect Negotiation)
+  // WebRTC Signaling listeners (Perfect Negotiation)
   useEffect(() => {
-    const handleOffer = async (payload: {
-      fromPlayerId: string;
-      sdp: RTCSessionDescriptionInit;
-    }) => {
-      if (!roomCode || payload.fromPlayerId === myPlayerId) return;
+    const handleOffer = async (raw: unknown) => {
+      const payload = raw as { fromPlayerId: string; sdp: RTCSessionDescriptionInit };
+      if (!payload || !roomCode || payload.fromPlayerId === myPlayerId) return;
       const pc = createPeerConnection();
       const description = payload.sdp;
 
@@ -396,11 +404,9 @@ export function useWebRTCVoice({
       }
     };
 
-    const handleAnswer = async (payload: {
-      fromPlayerId: string;
-      sdp: RTCSessionDescriptionInit;
-    }) => {
-      if (!roomCode || payload.fromPlayerId === myPlayerId) return;
+    const handleAnswer = async (raw: unknown) => {
+      const payload = raw as { fromPlayerId: string; sdp: RTCSessionDescriptionInit };
+      if (!payload || !roomCode || payload.fromPlayerId === myPlayerId) return;
       const pc = pcRef.current;
       if (!pc) return;
       try {
@@ -417,11 +423,9 @@ export function useWebRTCVoice({
       }
     };
 
-    const handleIceCandidate = async (payload: {
-      fromPlayerId: string;
-      candidate: RTCIceCandidateInit;
-    }) => {
-      if (!roomCode || payload.fromPlayerId === myPlayerId) return;
+    const handleIceCandidate = async (raw: unknown) => {
+      const payload = raw as { fromPlayerId: string; candidate: RTCIceCandidateInit };
+      if (!payload || !roomCode || payload.fromPlayerId === myPlayerId) return;
       const pc = pcRef.current;
       if (!pc || !pc.remoteDescription) {
         pendingCandidatesRef.current.push(payload.candidate);
@@ -455,11 +459,9 @@ export function useWebRTCVoice({
       }
     };
 
-    const handleOpponentSpeaking = (payload: {
-      playerId: string;
-      speaking: boolean;
-    }) => {
-      if (payload.playerId !== myPlayerId) {
+    const handleOpponentSpeaking = (raw: unknown) => {
+      const payload = raw as { playerId: string; speaking: boolean };
+      if (payload && payload.playerId !== myPlayerId) {
         setIsOpponentSpeaking(Boolean(payload.speaking));
       }
     };

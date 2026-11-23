@@ -27,6 +27,7 @@ export default function App() {
   const socket = useMemo(() => getSocket(), []);
 
   const [socketConnected, setSocketConnected] = useState(socket.connected);
+  const [connectionMode, setConnectionMode] = useState<'socket' | 'p2p'>(socket.mode);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [room, setRoom] = useState<PublicRoomState | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string | null>(null);
@@ -60,10 +61,12 @@ export default function App() {
   useEffect(() => {
     const handleConnect = () => {
       setSocketConnected(true);
+      setConnectionMode(socket.mode);
       setConnectionError(null);
       const saved = loadEphemeralSession();
       if (saved) {
-        socket.emit('room:reconnect', saved, (res: AckRoomResponse) => {
+        socket.emit('room:reconnect', saved, (rawRes: unknown) => {
+          const res = rawRes as AckRoomResponse;
           if (res?.ok && res.room && res.playerId) {
             setRoom(res.room);
             setMyPlayerId(res.playerId);
@@ -79,51 +82,46 @@ export default function App() {
       setSocketConnected(false);
     };
 
-    const handleConnectError = async (err: Error) => {
+    const handleConnectError = (rawErr: unknown) => {
       setSocketConnected(false);
-      const baseUrl = getServerUrl();
-      try {
-        const res = await fetch(`${baseUrl}/api/health`);
-        const contentType = res.headers.get('content-type') ?? '';
-        if (res.ok && contentType.includes('application/json')) {
-          setConnectionError(
-            `Reconnecting real-time channel (${err.message || 'transport retry'})...`
-          );
-          return;
-        }
-      } catch {
-        // Backend unreachable
+      if (socket.mode === 'p2p') {
+        setConnectionError(null);
+        return;
       }
-      const isNetlifyOrStatic =
-        typeof window !== 'undefined' &&
-        (window.location.hostname.endsWith('netlify.app') ||
-          window.location.hostname.endsWith('vercel.app') ||
-          window.location.hostname.endsWith('github.io')) &&
-        !import.meta.env.VITE_SERVER_URL;
-
+      const err = rawErr as Error | undefined;
       setConnectionError(
-        isNetlifyOrStatic
-          ? 'Netlify only hosts static files and cannot run the Node.js Socket.IO server. Deploy DUEL as a Node.js web service (e.g. Render, Railway, or Cloud Run) with "npm run build" + "npm start", or set VITE_SERVER_URL to your backend URL.'
-          : 'Cannot reach the multiplayer backend server. Ensure the Node.js server is running ("npm start").'
+        `Reconnecting real-time channel (${err?.message || 'transport retry'})...`
       );
     };
 
-    const handleRoomUpdated = (updatedRoom: PublicRoomState) => {
-      setRoom(updatedRoom);
+    const handleModeChanged = (rawMode: unknown) => {
+      if (rawMode === 'p2p' || rawMode === 'socket') {
+        setConnectionMode(rawMode);
+      }
     };
 
-    const handleGameMove = (payload: { move: MoveRecord; room: PublicRoomState }) => {
-      setRoom(payload.room);
+    const handleRoomUpdated = (rawRoom: unknown) => {
+      setRoom(rawRoom as PublicRoomState);
     };
 
-    const handlePeerLeft = (payload: { nickname?: string }) => {
+    const handleGameMove = (rawPayload: unknown) => {
+      const payload = rawPayload as { move: MoveRecord; room: PublicRoomState };
+      if (payload?.room) {
+        setRoom(payload.room);
+      }
+    };
+
+    const handlePeerLeft = (rawPayload: unknown) => {
+      const payload = (rawPayload as { nickname?: string }) ?? {};
       setPeerNotice(
         `${payload.nickname ?? 'Your friend'} left the room. Waiting for a player to join.`
       );
       window.setTimeout(() => setPeerNotice(null), 5000);
     };
 
-    const handleChatMessage = (message: ChatMessage) => {
+    const handleChatMessage = (rawMessage: unknown) => {
+      const message = rawMessage as ChatMessage;
+      if (!message?.id) return;
       setRoom((prev) => {
         if (!prev) return prev;
         if (prev.chatMessages.some((m) => m.id === message.id)) {
@@ -139,22 +137,24 @@ export default function App() {
     socket.on('connect', handleConnect);
     socket.on('disconnect', handleDisconnect);
     socket.on('connect_error', handleConnectError);
+    socket.on('mode:changed', handleModeChanged);
     socket.on('room:updated', handleRoomUpdated);
     socket.on('game:move', handleGameMove);
     socket.on('room:peer-left', handlePeerLeft);
     socket.on('chat:message', handleChatMessage);
 
-    setSocketConnected(socket.connected);
-    if (socket.connected) {
-      handleConnect();
-    } else if (!socket.active) {
-      socket.connect();
-    }
+    void socket.ensureReady().then((detectedMode) => {
+      setConnectionMode(detectedMode);
+      if (socket.connected) {
+        handleConnect();
+      }
+    });
 
     return () => {
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
       socket.off('connect_error', handleConnectError);
+      socket.off('mode:changed', handleModeChanged);
       socket.off('room:updated', handleRoomUpdated);
       socket.off('game:move', handleGameMove);
       socket.off('room:peer-left', handlePeerLeft);
@@ -163,12 +163,13 @@ export default function App() {
   }, [socket]);
 
   const ensureConnected = useCallback(
-    () =>
-      new Promise<boolean>((resolve) => {
-        if (socket.connected) {
-          resolve(true);
-          return;
-        }
+    async () => {
+      const detectedMode = await socket.ensureReady();
+      setConnectionMode(detectedMode);
+      if (socket.connected) {
+        return true;
+      }
+      return new Promise<boolean>((resolve) => {
         socket.connect();
         const timer = window.setTimeout(() => {
           socket.off('connect', onConnect);
@@ -179,7 +180,8 @@ export default function App() {
           resolve(true);
         };
         socket.once('connect', onConnect);
-      }),
+      });
+    },
     [socket]
   );
 
@@ -197,7 +199,7 @@ export default function App() {
       if (!ready) {
         setError(
           connectionError ??
-            'Unable to connect to the multiplayer server. Please try again.'
+            'Unable to initialize connection. Please try again.'
         );
         return;
       }
@@ -207,15 +209,16 @@ export default function App() {
         const timeoutId = window.setTimeout(() => {
           if (!settled) {
             settled = true;
-            setError('Server timed out creating room. Please try again.');
+            setError('Timed out creating room. Please try again.');
             resolve();
           }
-        }, 7000);
+        }, 12000);
 
         socket.emit(
           'room:create',
           { nickname, avatarId },
-          (res: AckRoomResponse) => {
+          (rawRes: unknown) => {
+            const res = rawRes as AckRoomResponse;
             if (settled) return;
             settled = true;
             window.clearTimeout(timeoutId);
@@ -253,7 +256,7 @@ export default function App() {
       if (!ready) {
         setError(
           connectionError ??
-            'Unable to connect to the multiplayer server. Please try again.'
+            'Unable to initialize connection. Please try again.'
         );
         return;
       }
@@ -263,15 +266,16 @@ export default function App() {
         const timeoutId = window.setTimeout(() => {
           if (!settled) {
             settled = true;
-            setError('Server timed out joining room. Please try again.');
+            setError('Timed out joining room. Please try again.');
             resolve();
           }
-        }, 7000);
+        }, 12000);
 
         socket.emit(
           'room:join',
           { roomCode, nickname, avatarId },
-          (res: AckRoomResponse) => {
+          (rawRes: unknown) => {
+            const res = rawRes as AckRoomResponse;
             if (settled) return;
             settled = true;
             window.clearTimeout(timeoutId);
@@ -396,6 +400,7 @@ export default function App() {
       {!room || !myPlayerId ? (
         <HomeScreen
           socketConnected={socketConnected}
+          connectionMode={connectionMode}
           connectionError={connectionError}
           onRetryConnection={handleRetryConnection}
           initialRoomCode={initialRoomCode}

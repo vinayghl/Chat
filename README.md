@@ -46,22 +46,14 @@ DUEL is a real-time, mobile-first two-player Snake & Ladders web game with live 
 
 ## Deployment Guide
 
-> **Important:** DUEL requires a running **Node.js server** (`server.ts`) for Socket.IO multiplayer rooms and WebRTC signaling. **Static-only hosts like Netlify, Vercel Static, or GitHub Pages cannot run `server.ts` by themselves.**
+DUEL automatically runs in **two modes** depending on how you deploy it:
 
-### Option A (Recommended): Deploy Full-Stack on Render, Railway, Fly.io, or Cloud Run
-Both the React frontend and the Node.js Socket.IO backend run together in one service:
+1. **Zero-Backend Static Hosting (Netlify, Vercel Static, Cloudflare Pages, GitHub Pages)**
+   - Simply deploy with build command `npm run build` and publish directory `dist`.
+   - When no Node.js backend is detected on `/api/health`, DUEL automatically switches to **P2P Serverless Mode** using WebRTC DataChannels + PeerJS signaling (`0.peerjs.com`) for rooms, gameplay, text chat, and live voice chat—**no backend server required**.
 
-1. **Build Command**: `npm install && npm run build`
-2. **Start Command**: `npm start` (runs `NODE_ENV=production node server.ts`)
-3. **Node Version**: Node 22+ (uses native TypeScript execution for `server.ts`)
-4. **Render Blueprint**: A `render.yaml` file is included at the repo root for instant deployment on Render.
-5. **HTTPS**: All of these platforms provide HTTPS automatically, which is required by iOS Safari and Android Chrome for microphone access.
-
-### Option B: Keep Frontend on Netlify + Host Backend on Render / Railway
-If you want to keep your frontend at `https://your-site.netlify.app`:
-
-1. Deploy this repository as a **Web Service** on **Render** or **Railway** (`npm install && npm run build`, start: `npm start`).
-   - Optionally set `CLIENT_ORIGIN=https://your-site.netlify.app` on the backend service.
-2. In **Netlify → Site configuration → Environment variables**, add:
-   - `VITE_SERVER_URL=https://your-backend-service.onrender.com`
-3. Trigger a **Clear cache and deploy site** in Netlify so Vite bundles `VITE_SERVER_URL` into the frontend.
+2. **Full-Stack Node.js Hosting (Render, Railway, Fly.io, Cloud Run)**
+   - Build command: `npm install && npm run build`
+   - Start command: `npm start` (runs `NODE_ENV=production node server.ts`)
+   - Runs the authoritative Socket.IO server (`server.ts`) and serves `/api/ice-config` with optional `TURN_URL`/`TURN_USERNAME`/`TURN_CREDENTIAL` credentials.
+   - A `render.yaml` file is included at the repo root for one-click deployment on Render.
