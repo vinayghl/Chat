@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: duel-snake-ladders
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: STUN_URL
+        value: stun:stun.l.google.com:19302

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Socket } from 'socket.io-client';
 import type { IceConfigResponse, PlayerSlot } from '../shared/gameConstants.ts';
+import { getServerUrl } from '../socket/socketClient.ts';
 
 export type VoiceConnectionStatus =
   | 'idle'
@@ -78,7 +79,8 @@ export function useWebRTCVoice({
   // Fetch STUN/TURN ICE configuration once on mount
   useEffect(() => {
     let active = true;
-    fetch('/api/ice-config')
+    const baseUrl = getServerUrl();
+    fetch(`${baseUrl}/api/ice-config`)
       .then((res) => res.json())
       .then((data: IceConfigResponse) => {
         if (active && Array.isArray(data.iceServers) && data.iceServers.length > 0) {

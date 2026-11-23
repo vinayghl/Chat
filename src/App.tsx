@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ChatMessage, MoveRecord, PublicRoomState } from './shared/gameConstants.ts';
 import {
   clearEphemeralSession,
+  getServerUrl,
   getSocket,
   loadEphemeralSession,
   saveEphemeralSession,
@@ -80,8 +81,9 @@ export default function App() {
 
     const handleConnectError = async (err: Error) => {
       setSocketConnected(false);
+      const baseUrl = getServerUrl();
       try {
-        const res = await fetch('/api/health');
+        const res = await fetch(`${baseUrl}/api/health`);
         const contentType = res.headers.get('content-type') ?? '';
         if (res.ok && contentType.includes('application/json')) {
           setConnectionError(
@@ -92,8 +94,17 @@ export default function App() {
       } catch {
         // Backend unreachable
       }
+      const isNetlifyOrStatic =
+        typeof window !== 'undefined' &&
+        (window.location.hostname.endsWith('netlify.app') ||
+          window.location.hostname.endsWith('vercel.app') ||
+          window.location.hostname.endsWith('github.io')) &&
+        !import.meta.env.VITE_SERVER_URL;
+
       setConnectionError(
-        'Cannot reach the multiplayer backend server. Ensure the app is started with "npm start" (node server.ts).'
+        isNetlifyOrStatic
+          ? 'Netlify only hosts static files and cannot run the Node.js Socket.IO server. Deploy DUEL as a Node.js web service (e.g. Render, Railway, or Cloud Run) with "npm run build" + "npm start", or set VITE_SERVER_URL to your backend URL.'
+          : 'Cannot reach the multiplayer backend server. Ensure the Node.js server is running ("npm start").'
       );
     };
 

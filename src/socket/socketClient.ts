@@ -3,17 +3,38 @@ import { io, type Socket } from 'socket.io-client';
 let socketInstance: Socket | null = null;
 let errorCount = 0;
 
+/**
+ * Resolves the multiplayer backend URL.
+ * - When deployed as a single full-stack Node.js service (Render, Railway, Cloud Run, local dev),
+ *   VITE_SERVER_URL is empty and it connects to window.location.origin.
+ * - When the frontend is hosted statically (e.g. Netlify), set VITE_SERVER_URL to the
+ *   deployed Node.js backend URL (e.g. https://duel-server.onrender.com).
+ */
+export function getServerUrl(): string {
+  const configured = import.meta.env.VITE_SERVER_URL;
+  if (typeof configured === 'string' && configured.trim().length > 0) {
+    return configured.trim().replace(/\/+$/, '');
+  }
+  if (typeof window !== 'undefined') {
+    return window.location.origin;
+  }
+  return '';
+}
+
 export function getSocket(): Socket {
   if (!socketInstance) {
-    const serverUrl =
-      typeof window !== 'undefined' ? window.location.origin : undefined;
+    const serverUrl = getServerUrl();
+    const isCrossOrigin =
+      typeof window !== 'undefined' &&
+      serverUrl !== '' &&
+      serverUrl !== window.location.origin;
 
-    socketInstance = io(serverUrl, {
+    socketInstance = io(serverUrl || undefined, {
       path: '/socket.io/',
       autoConnect: true,
       transports: ['polling', 'websocket'],
       upgrade: true,
-      withCredentials: true,
+      withCredentials: !isCrossOrigin,
       timeout: 8000,
       reconnection: true,
       reconnectionAttempts: Infinity,
@@ -21,8 +42,7 @@ export function getSocket(): Socket {
       reconnectionDelayMax: 3000,
     });
 
-    // If initial polling+upgrade fails behind a proxy or multi-instance load balancer,
-    // cycle transport order automatically so either WebSocket-only or polling-only succeeds.
+    // Cycle transport order if a proxy or multi-instance load balancer rejects one transport
     socketInstance.on('connect_error', () => {
       errorCount += 1;
       if (!socketInstance) return;

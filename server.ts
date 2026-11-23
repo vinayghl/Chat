@@ -16,14 +16,36 @@ async function bootstrap() {
   app.set('trust proxy', 1);
   app.use(express.json());
 
+  const allowedOriginEnv = process.env.CLIENT_ORIGIN?.trim();
+  const allowedOrigins = allowedOriginEnv
+    ? allowedOriginEnv.split(',').map((o) => o.trim()).filter(Boolean)
+    : null;
+
+  app.use('/api', (req, res, next) => {
+    const reqOrigin = req.headers.origin;
+    if (!allowedOrigins) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    } else if (reqOrigin && allowedOrigins.includes(reqOrigin)) {
+      res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+      res.setHeader('Vary', 'Origin');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(204);
+      return;
+    }
+    next();
+  });
+
   const httpServer = http.createServer(app);
   const io = new SocketIOServer(httpServer, {
     path: '/socket.io/',
     transports: ['polling', 'websocket'],
     allowEIO3: true,
     cors: {
-      origin: true,
-      credentials: true,
+      origin: allowedOrigins ?? true,
+      credentials: !allowedOrigins ? false : true,
     },
     pingInterval: 15000,
     pingTimeout: 20000,
